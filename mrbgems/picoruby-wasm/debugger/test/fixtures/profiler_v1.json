@@ -1,0 +1,55 @@
+{
+  "fixture": {
+    "schema_version": 1,
+    "source_repository": "ydah/funicular-profiler",
+    "source_revision": "3897b2b61ee2fb86b2aa57dc448f1002f00664092846a321487214e60c228738",
+    "source_revision_kind": "design_document_sha256",
+    "source_status": "unpublished design dated 2026-08-31"
+  },
+  "snapshot": {
+    "schema_version": 1,
+    "session_id": 3,
+    "recording": true,
+    "cursor": 0,
+    "next_cursor": 2,
+    "oldest_seq": 1,
+    "newest_seq": 2,
+    "cursor_gap": false,
+    "has_more": false,
+    "dropped_count": 0,
+    "dropped_in_flight_count": 0,
+    "truncated_attribute_count": 0,
+    "adapter_error_count": 0,
+    "records": [
+      {
+        "schema_version": 1,
+        "seq": 1,
+        "kind": "span",
+        "id": "s-1",
+        "parent_id": null,
+        "name": "funicular.component.update",
+        "started_at_us": 1000,
+        "duration_us": 200,
+        "status": "ok",
+        "attributes": {
+          "funicular.component.class": "ProductList",
+          "funicular.diff.empty": true
+        }
+      },
+      {
+        "schema_version": 1,
+        "seq": 2,
+        "kind": "span",
+        "id": "s-2",
+        "parent_id": "s-1",
+        "name": "funicular.vdom.diff",
+        "started_at_us": 1050,
+        "duration_us": 80,
+        "status": "error",
+        "attributes": {
+          "funicular.component.class": "ProductList"
+        }
+      }
+    ]
+  }
+}
