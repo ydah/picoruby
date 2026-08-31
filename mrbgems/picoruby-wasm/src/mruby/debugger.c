@@ -596,6 +596,120 @@ debug_json_error(const char *msg)
   return err_buf;
 }
 
+/* Execute a fixed profiler expression and copy its JSON String result. */
+static const char *
+profiler_eval_json(const char *code)
+{
+  if (!global_mrb) {
+    return "{\"error\":\"module_unavailable\"}";
+  }
+
+  int arena_index = mrb_gc_arena_save(global_mrb);
+  mrb_value result = debug_eval_code(global_mrb, code, strlen(code));
+  if (global_mrb->exc) {
+    global_mrb->exc = NULL;
+    mrb_gc_arena_restore(global_mrb, arena_index);
+    return "{\"error\":\"ruby_exception\"}";
+  }
+  if (mrb_exception_p(result)) {
+    mrb_gc_arena_restore(global_mrb, arena_index);
+    return "{\"error\":\"ruby_exception\"}";
+  }
+  if (mrb_undef_p(result)) {
+    mrb_gc_arena_restore(global_mrb, arena_index);
+    return "{\"error\":\"compile_error\"}";
+  }
+  if (!mrb_string_p(result)) {
+    mrb_gc_arena_restore(global_mrb, arena_index);
+    return "{\"error\":\"invalid_response\"}";
+  }
+
+  mrb_int length = RSTRING_LEN(result);
+  if (length >= JSON_BUFFER_SIZE) {
+    mrb_gc_arena_restore(global_mrb, arena_index);
+    return "{\"error\":\"response_too_large\",\"max_bytes\":65535}";
+  }
+  memcpy(json_buffer, RSTRING_PTR(result), (size_t)length);
+  json_buffer[length] = '\0';
+  mrb_gc_arena_restore(global_mrb, arena_index);
+  return json_buffer;
+}
+
+EMSCRIPTEN_KEEPALIVE
+int
+mrb_funicular_profiler_available(void)
+{
+  static const char code[] =
+    "p=$__funicular_profiler__;"
+    "(p && p.respond_to?(:snapshot_json) && p.respond_to?(:summary_json) && "
+    "p.respond_to?(:start!) && p.respond_to?(:stop!) && "
+    "p.respond_to?(:clear!) && p.respond_to?(:recording?)) ? '1' : '0'";
+
+  if (!global_mrb) return 0;
+
+  int arena_index = mrb_gc_arena_save(global_mrb);
+  mrb_value result = debug_eval_code(global_mrb, code, sizeof(code) - 1);
+  if (global_mrb->exc) {
+    global_mrb->exc = NULL;
+    mrb_gc_arena_restore(global_mrb, arena_index);
+    return 0;
+  }
+  int available = mrb_string_p(result) && RSTRING_LEN(result) == 1 &&
+                  RSTRING_PTR(result)[0] == '1';
+  mrb_gc_arena_restore(global_mrb, arena_index);
+  return available;
+}
+
+EMSCRIPTEN_KEEPALIVE
+const char *
+mrb_funicular_profiler_snapshot(uint32_t after_seq, uint32_t limit)
+{
+  char code[128];
+  if (!mrb_funicular_profiler_available()) {
+    return "{\"error\":\"profiler_unavailable\"}";
+  }
+  if (limit < 1) limit = 1;
+  if (limit > 200) limit = 200;
+  snprintf(code, sizeof(code),
+           "$__funicular_profiler__.snapshot_json(%u,%u)",
+           (unsigned int)after_seq, (unsigned int)limit);
+  return profiler_eval_json(code);
+}
+
+EMSCRIPTEN_KEEPALIVE
+const char *
+mrb_funicular_profiler_summary(void)
+{
+  if (!mrb_funicular_profiler_available()) {
+    return "{\"error\":\"profiler_unavailable\"}";
+  }
+  return profiler_eval_json("$__funicular_profiler__.summary_json");
+}
+
+EMSCRIPTEN_KEEPALIVE
+const char *
+mrb_funicular_profiler_control(const char *command)
+{
+  const char *code;
+  if (!command) return "{\"error\":\"unknown_command\"}";
+  if (strcmp(command, "start") == 0) {
+    code = "p=$__funicular_profiler__;p.start!;s=JSON.parse(p.summary_json);JSON.generate({schema_version:1,ok:true,recording:!!p.recording?,session_id:s['session_id']})";
+  } else if (strcmp(command, "stop") == 0) {
+    code = "p=$__funicular_profiler__;p.stop!;s=JSON.parse(p.summary_json);JSON.generate({schema_version:1,ok:true,recording:!!p.recording?,session_id:s['session_id']})";
+  } else if (strcmp(command, "clear") == 0) {
+    code = "p=$__funicular_profiler__;p.clear!;s=JSON.parse(p.summary_json);JSON.generate({schema_version:1,ok:true,recording:!!p.recording?,session_id:s['session_id']})";
+  } else if (strcmp(command, "status") == 0) {
+    code = "p=$__funicular_profiler__;s=JSON.parse(p.summary_json);JSON.generate({schema_version:1,ok:true,recording:!!p.recording?,session_id:s['session_id']})";
+  } else {
+    return "{\"error\":\"unknown_command\"}";
+  }
+
+  if (!mrb_funicular_profiler_available()) {
+    return "{\"error\":\"profiler_unavailable\"}";
+  }
+  return profiler_eval_json(code);
+}
+
 /*
  * Temporarily clear env->cxt for on-stack envs in the binding's proc
  * chain so that local_variable_get/set can access the suspended task's
