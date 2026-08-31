@@ -120,6 +120,38 @@ The panel shows the live component tree. Clicking a component opens the
 **Inspector** showing its `state` hash and instance variables. The tree
 refreshes automatically every 500 ms.
 
+## Funicular Profiler
+
+The **Profiler** view is available in a debug build when the inspected
+application installs `funicular-profiler`. PicoRuby detects the profiler at
+runtime; it does not bundle or depend on Funicular.
+
+Use **Record** / **Stop** to control collection, **Clear** to begin a new
+session, **Refresh** to fetch immediately, and **Export** to download the
+bounded profile currently held by DevTools. The view contains:
+
+- **Summary** — count, errors, total, average, max, p50, p95, and empty-diff
+  rate for the current bounded record window
+- **Timeline** — newest records with name, component, status, duration, and
+  parent ID
+- **Details** — the selected record and its sanitized attributes
+
+Polling occurs only while the Profiler view and DevTools document are visible.
+Each request fetches at most 200 records, and the client retains at most 5,000
+records while rendering at most 1,000 rows. A cursor-gap or dropped-record
+banner means older data was overwritten; exported data is then marked
+`incomplete`.
+
+Profiler data stays in the inspected browser session. The debugger does not
+add page URLs, user-agent strings, DOM, cookies, local storage, request bodies,
+state, props, or raw SQL to records or exports.
+
+If the view says **Profiler not installed**, install and start
+`funicular-profiler` in the application. **Unsupported profiler schema** means
+the profiler and DevTools disagree on the protocol major version. A
+**Response too large** error requires reducing the profiler page/attribute
+limits; JSON is never byte-truncated.
+
 ## How the debug API works
 
 The extension communicates with the page exclusively through
@@ -141,5 +173,12 @@ The JavaScript calls into the WASM module via `window.picorubyModule.ccall`:
 | `mrb_debug_next` | Step over |
 | `mrb_get_component_debug_info` | Funicular component tree |
 | `mrb_get_component_state_by_id` | Funicular component state |
+| `mrb_funicular_profiler_available` | Detect the profiler protocol at runtime |
+| `mrb_funicular_profiler_snapshot` | Fetch up to 200 records after a cursor |
+| `mrb_funicular_profiler_summary` | Fetch aggregate summary JSON |
+| `mrb_funicular_profiler_control` | Allowlisted start/stop/clear/status control |
 
 The extension polls `mrb_debug_get_status` every 200 ms to detect pause events.
+The profiler functions and their 64 KiB response buffer are exported only by
+debug builds. They accept fixed operations and numeric cursor arguments, not
+arbitrary Ruby code or method names.

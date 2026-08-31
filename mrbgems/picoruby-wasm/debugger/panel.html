@@ -41,6 +41,17 @@
       color: #f0c674;
     }
 
+    .view-tab[aria-selected="true"] {
+      color: #ffffff;
+      border-color: #007acc;
+      background: #094771;
+    }
+
+    .toolbar-group {
+      display: flex;
+      gap: 6px;
+    }
+
     .repl-prompt.debug {
       color: #f0c674;
     }
@@ -50,6 +61,155 @@
       flex: 1;
       display: flex;
       overflow: hidden;
+    }
+
+    .hidden-view {
+      display: none !important;
+    }
+
+    /* Profiler */
+    .profiler-view {
+      flex: 1;
+      min-height: 0;
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    .profiler-toolbar,
+    .profiler-filters {
+      padding: 6px 8px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      flex-wrap: wrap;
+      border-bottom: 1px solid #454545;
+      background: #252526;
+    }
+
+    .profiler-filters label {
+      color: #888;
+    }
+
+    .profiler-filters input,
+    .profiler-filters select {
+      color: #cccccc;
+      background: #1e1e1e;
+      border: 1px solid #555;
+      padding: 3px 5px;
+      min-width: 100px;
+    }
+
+    .profiler-status {
+      margin-left: auto;
+      color: #888;
+    }
+
+    .profiler-banner {
+      padding: 7px 9px;
+      color: #f0c674;
+      background: #352f1e;
+      border-bottom: 1px solid #6c5c26;
+    }
+
+    .profiler-main {
+      flex: 1;
+      min-height: 0;
+      display: grid;
+      grid-template-columns: minmax(0, 2fr) minmax(220px, 1fr);
+      grid-template-rows: minmax(140px, 1fr) minmax(180px, 2fr);
+      overflow: hidden;
+    }
+
+    .profiler-pane {
+      min-width: 0;
+      min-height: 0;
+      overflow: auto;
+      border-right: 1px solid #454545;
+      border-bottom: 1px solid #454545;
+    }
+
+    .profiler-pane h2 {
+      position: sticky;
+      top: 0;
+      z-index: 1;
+      padding: 6px 8px;
+      font-size: 10px;
+      text-transform: uppercase;
+      color: #888;
+      background: #2d2d2d;
+    }
+
+    .profiler-timeline {
+      grid-column: 1 / -1;
+    }
+
+    .profiler-table {
+      width: 100%;
+      border-collapse: collapse;
+      white-space: nowrap;
+      font-family: 'Menlo', 'Monaco', 'Courier New', monospace;
+      font-size: 10px;
+    }
+
+    .profiler-table th,
+    .profiler-table td {
+      padding: 4px 7px;
+      text-align: right;
+      border-bottom: 1px solid #333;
+    }
+
+    .profiler-table th {
+      position: sticky;
+      top: 25px;
+      background: #252526;
+      color: #9cdcfe;
+      cursor: pointer;
+    }
+
+    .profiler-table th:first-child,
+    .profiler-table td:first-child,
+    .profiler-table th:nth-child(2),
+    .profiler-table td:nth-child(2) {
+      text-align: left;
+    }
+
+    .profiler-table tbody tr {
+      cursor: pointer;
+    }
+
+    .profiler-table tbody tr:hover,
+    .profiler-table tbody tr.selected {
+      background: #094771;
+    }
+
+    .profiler-table tbody tr.error {
+      color: #f48771;
+    }
+
+    .profiler-details {
+      padding: 8px;
+      font-family: 'Menlo', 'Monaco', 'Courier New', monospace;
+      font-size: 10px;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+    }
+
+    @media (max-width: 700px) {
+      .profiler-main {
+        display: block;
+        overflow-y: auto;
+      }
+      .profiler-pane {
+        min-height: 180px;
+      }
+      .profiler-toolbar .debug-btn {
+        flex: 1;
+      }
+      .profiler-status {
+        width: 100%;
+        margin-left: 0;
+      }
     }
 
     /* Left panel: REPL */
@@ -424,13 +584,19 @@
 <body>
   <!-- Toolbar -->
   <div class="toolbar">
-    <button class="debug-btn debug-btn-continue" id="btnContinue" title="Continue (F8)" disabled>&#9654; Continue</button>
-    <button class="debug-btn" id="btnStep" title="Step Into (F11)" disabled>&#8595; Step Into</button>
-    <button class="debug-btn" id="btnNext" title="Next (F10)" disabled>&#8594; Next</button>
+    <span class="toolbar-group" role="tablist" aria-label="Debugger view">
+      <button class="debug-btn view-tab" id="consoleTab" role="tab" aria-controls="consoleView" aria-selected="true">Console</button>
+      <button class="debug-btn view-tab" id="profilerTab" role="tab" aria-controls="profilerView" aria-selected="false" disabled>Profiler</button>
+    </span>
+    <span class="toolbar-group" id="consoleControls">
+      <button class="debug-btn debug-btn-continue" id="btnContinue" title="Continue (F8)" disabled>&#9654; Continue</button>
+      <button class="debug-btn" id="btnStep" title="Step Into (F11)" disabled>&#8595; Step Into</button>
+      <button class="debug-btn" id="btnNext" title="Next (F10)" disabled>&#8594; Next</button>
+    </span>
     <span class="status" id="status">Connecting...</span>
   </div>
 
-  <div class="content">
+  <div class="content" id="consoleView" role="tabpanel" aria-labelledby="consoleTab">
     <!-- REPL panel -->
     <div class="repl-panel">
       <div class="repl-output" id="replOutput">
@@ -485,6 +651,59 @@
     </div>
   </div>
 
+  <div class="profiler-view hidden-view" id="profilerView" role="tabpanel" aria-labelledby="profilerTab">
+    <div class="profiler-toolbar">
+      <button class="debug-btn" id="profilerRecord" title="Start recording">Record</button>
+      <button class="debug-btn" id="profilerClear" title="Clear this profile">Clear</button>
+      <button class="debug-btn" id="profilerRefresh" title="Refresh now">Refresh</button>
+      <button class="debug-btn" id="profilerExport" title="Export profile as JSON">Export</button>
+      <span class="profiler-status" id="profilerStatus">Profiler not installed</span>
+    </div>
+    <div class="profiler-banner hidden-view" id="profilerBanner" role="status"></div>
+    <div class="profiler-filters">
+      <label for="profilerNameFilter">Name</label>
+      <input id="profilerNameFilter" type="search" maxlength="128">
+      <label for="profilerComponentFilter">Component</label>
+      <input id="profilerComponentFilter" type="search" maxlength="128">
+      <label for="profilerStatusFilter">Status</label>
+      <select id="profilerStatusFilter">
+        <option value="all">All</option>
+        <option value="ok">OK</option>
+        <option value="error">Error</option>
+        <option value="cancelled">Cancelled</option>
+      </select>
+    </div>
+    <div class="profiler-main">
+      <section class="profiler-pane">
+        <h2>Summary <span id="profilerSummaryHint">(buffer window)</span></h2>
+        <table class="profiler-table">
+          <thead><tr>
+            <th data-sort="name">Operation</th><th data-sort="component_class">Component</th>
+            <th data-sort="count">Count</th><th data-sort="error_count">Errors</th>
+            <th data-sort="total_us">Total</th><th data-sort="average_us">Average</th>
+            <th data-sort="max_us">Max</th><th data-sort="p50_us">p50</th>
+            <th data-sort="p95_us">p95</th><th data-sort="empty_diff_rate">Empty diff</th>
+          </tr></thead>
+          <tbody id="profilerSummaryBody"></tbody>
+        </table>
+      </section>
+      <section class="profiler-pane">
+        <h2>Details</h2>
+        <div class="profiler-details" id="profilerDetails">Select a record</div>
+      </section>
+      <section class="profiler-pane profiler-timeline">
+        <h2>Timeline</h2>
+        <table class="profiler-table">
+          <thead><tr><th>Start</th><th>Duration</th><th>Operation</th>
+            <th>Component</th><th>Status</th><th>Parent</th></tr></thead>
+          <tbody id="profilerTimelineBody"></tbody>
+        </table>
+      </section>
+    </div>
+  </div>
+
+  <script src="profiler_model.js"></script>
+  <script src="profiler_transport.js"></script>
   <script src="panel.js"></script>
 </body>
 </html>
