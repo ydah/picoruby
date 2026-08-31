@@ -113,5 +113,15 @@ jobs:
       with:
         version: '3.1.64'
 
+    - name: Test DevTools profiler model and transport
+      run: node --test mrbgems/picoruby-wasm/debugger/test/*.test.cjs
+
     - name: Test WASM
       run: rake test:gems:wasm
+
+    - name: Test debug-only profiler bridge
+      run: |
+        CONFIG=picoruby-wasm rake
+        node mrbgems/picoruby-wasm/debugger/test/profiler_bridge_integration.mjs \
+          build/picoruby-wasm-test/bin/picoruby.js \
+          build/picoruby-wasm/bin/picoruby.wasm
