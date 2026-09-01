@@ -8,6 +8,10 @@ class Base64Test < Picotest::Test
     assert_equal "cGljb3J1Ynk=", Base64.encode64("picoruby")
   end
 
+  def test_prebuilt_feature_is_registered
+    assert $LOADED_FEATURES.include?("base64")
+  end
+
   def test_decode
     assert_equal "picoruby", Base64.decode64("cGljb3J1Ynk=")
   end
@@ -19,4 +23,3 @@ class Base64Test < Picotest::Test
     assert_equal long_string, decoded
   end
 end
-
