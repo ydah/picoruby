@@ -35,7 +35,6 @@ class PicoRubyDebugger {
     this.profilerPollTimer = null;
     this.profilerRequestInFlight = false;
     this.profilerBackoff = 500;
-    this.lastProfilerError = null;
 
     this.isPaused = false;
     this.pauseId = -1;
@@ -301,6 +300,7 @@ class PicoRubyDebugger {
     this.profilerTransport.resetGeneration();
     this.stopProfilerPolling();
     this.profilerModel.clearLocal();
+    this.profilerModel.connectionState = 'reconnecting';
     this.profilerAvailable = false;
     this.profilerTab.disabled = true;
     this.isConnected = false;
@@ -877,6 +877,11 @@ class PicoRubyDebugger {
     if (this.profilerRequestInFlight || this.activeView !== 'profiler') return;
     this.stopProfilerPolling();
     this.profilerRequestInFlight = true;
+    if (this.profilerModel.connectionState !== 'connected' &&
+        this.profilerModel.connectionState !== 'reconnecting') {
+      this.profilerModel.connectionState = 'loading';
+    }
+    this.profilerStatus.textContent = this.profilerModel.statusText();
     const generation = this.profilerTransport.generation;
     try {
       const availability = await this.profilerTransport.checkProfilerAvailability(generation);
@@ -884,7 +889,8 @@ class PicoRubyDebugger {
       if (availability.error) throw new Error(availability.error);
       this.profilerAvailable = availability.available;
       if (!this.profilerAvailable) {
-        this.profilerStatus.textContent = 'Profiler not installed';
+        this.profilerModel.connectionState = 'unavailable';
+        this.profilerStatus.textContent = this.profilerModel.statusText();
         this.setProfilerBanner(
           'Install and start funicular-profiler in the inspected application.'
         );
@@ -898,27 +904,25 @@ class PicoRubyDebugger {
         this.profilerModel.applySummary(summary);
       }
 
-      let page = 0;
-      let hasMore = true;
-      while (hasMore && page < 5) {
-        const snapshot = await this.profilerTransport.fetchSnapshot(
-          this.profilerModel.cursor, 200, generation
-        );
-        if (!snapshot) return;
-        if (snapshot.error) throw new Error(snapshot.error);
-        const applied = this.profilerModel.applySnapshot(snapshot);
-        hasMore = applied.hasMore;
-        page++;
+      const pages = await this.profilerTransport.fetchSnapshotPages(
+        this.profilerModel.cursor, generation,
+        snapshot => this.profilerModel.applySnapshot(snapshot)
+      );
+      if (!pages) return;
+      if (pages.hasMore) {
+        this.setProfilerBanner('More records are waiting; polling is page-limited.');
       }
-      if (hasMore) this.setProfilerBanner('More records are waiting; polling is page-limited.');
       else this.updateProfilerWarnings();
       this.profilerBackoff = 500;
-      this.lastProfilerError = null;
       this.renderProfiler();
     } catch (error) {
       this.profilerBackoff = Math.min(this.profilerBackoff * 2, 5000);
       if (error.message === 'unsupported_schema') this.profilerAvailable = false;
       this.showProfilerError(error.message || 'disconnected');
+      if (!this.profilerAvailable &&
+          ['module_unavailable', 'ccall_error', 'devtools_eval_error'].includes(error.message)) {
+        this.scheduleConnectionRetry(this.profilerBackoff);
+      }
     } finally {
       this.profilerRequestInFlight = false;
       const delay = this.profilerModel.recording ? 500 : 2000;
@@ -973,8 +977,6 @@ class PicoRubyDebugger {
   }
 
   showProfilerError(message) {
-    if (message === this.lastProfilerError) return;
-    this.lastProfilerError = message;
     const errors = {
       unsupported_schema: ['Unsupported schema',
         'Unsupported profiler schema. Upgrade PicoRuby DevTools.'],
@@ -982,10 +984,30 @@ class PicoRubyDebugger {
         'Profiler response exceeded 65,535 bytes. Reduce snapshot or attribute limits.'],
       protocol_error: ['Protocol error', 'Malformed profiler response.'],
       invalid_json: ['Protocol error', 'Profiler returned invalid JSON.'],
+      invalid_response: ['Protocol error',
+        'The profiler API returned a non-String response.'],
+      ruby_exception: ['Ruby exception',
+        'The profiler raised while handling the request.'],
+      compile_error: ['Bridge compile error',
+        'PicoRuby could not compile the fixed profiler bridge expression.'],
+      module_unavailable: ['Reconnecting',
+        'PicoRuby module is unavailable. Reconnecting...'],
+      debug_api_unavailable: ['Debug API unavailable',
+        'Use a debug PicoRuby.wasm package with profiler support.'],
+      ccall_error: ['Reconnecting',
+        'The profiler bridge call failed. Reconnecting...'],
+      devtools_eval_error: ['Reconnecting',
+        'DevTools could not evaluate the profiler request. Reconnecting...'],
+      request_in_flight: ['Loading', 'A profiler request is already in progress.'],
       profiler_unavailable: ['Profiler not installed',
         'Install and start funicular-profiler in the inspected application.'],
     };
     const key = message.startsWith('protocol_error') ? 'protocol_error' : message;
+    if (['module_unavailable', 'ccall_error', 'devtools_eval_error'].includes(key)) {
+      this.profilerModel.connectionState = 'reconnecting';
+    } else {
+      this.profilerModel.connectionState = 'error';
+    }
     const display = errors[key] || ['Disconnected', 'Profiler error: ' + message];
     this.profilerStatus.textContent = display[0];
     this.setProfilerBanner(display[1]);
@@ -1001,9 +1023,7 @@ class PicoRubyDebugger {
     document.getElementById('profilerRecord').textContent = recording ? 'Stop' : 'Record';
     document.getElementById('profilerRecord').title = recording
       ? 'Stop recording' : 'Start recording';
-    const dropped = this.profilerModel.counters.dropped_count || 0;
-    this.profilerStatus.textContent = `${recording ? 'Recording' : 'Stopped'} · ` +
-      `${this.profilerModel.records.length} records · ${dropped} dropped`;
+    this.profilerStatus.textContent = this.profilerModel.statusText();
     this.renderProfilerSummary();
     this.renderProfilerTimeline();
     if (!this.profilerModel.selectedRecordId) {
@@ -1105,16 +1125,15 @@ class PicoRubyDebugger {
   }
 
   exportProfiler() {
-    const exported = this.profilerModel.exportObject({
-      profiler_version: 'unknown',
-      pico_ruby_debugger_version: '0.2.1',
-    });
+    const manifest = chrome.runtime && chrome.runtime.getManifest
+      ? chrome.runtime.getManifest() : null;
+    const exported = this.profilerModel.exportObject(manifest
+      ? { pico_ruby_debugger_version: manifest.version } : null);
     const json = JSON.stringify(exported, null, 2);
     const blob = new Blob([json], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
     const link = document.createElement('a');
-    const stamp = new Date().toISOString().replace(/[-:]/g, '').slice(0, 15);
-    link.download = `funicular-profile-${stamp}.json`;
+    link.download = PicoRubyProfilerModel.ProfilerModel.exportFilename();
     link.href = url;
     link.click();
     setTimeout(() => URL.revokeObjectURL(url), 0);

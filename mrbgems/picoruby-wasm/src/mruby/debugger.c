@@ -625,7 +625,7 @@ profiler_eval_json(const char *code)
   }
 
   mrb_int length = RSTRING_LEN(result);
-  if (length >= JSON_BUFFER_SIZE) {
+  if (length >= JSON_BUFFER_SIZE - 1) {
     mrb_gc_arena_restore(global_mrb, arena_index);
     return "{\"error\":\"response_too_large\",\"max_bytes\":65535}";
   }
