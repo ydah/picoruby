@@ -79,7 +79,7 @@ module Kernel
 
 end
 
-$LOADED_FEATURES = ["require"]
+$LOADED_FEATURES ||= ["require"]
 
 if RUBY_ENGINE == 'mruby/c'
   class Object
