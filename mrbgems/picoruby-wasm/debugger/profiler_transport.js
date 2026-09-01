@@ -9,27 +9,31 @@
     constructor(evalInPage) {
       this.evalInPage = evalInPage;
       this.generation = 0;
-      this.requestInFlight = false;
+      this.activeRequest = null;
     }
 
     resetGeneration() {
       this.generation++;
+      this.activeRequest = null;
       return this.generation;
     }
 
     async call(code, generation) {
-      if (this.requestInFlight) throw new Error('request_in_flight');
-      this.requestInFlight = true;
+      const requestGeneration = generation === undefined ? this.generation : generation;
+      if (requestGeneration !== this.generation) return null;
+      if (this.activeRequest) throw new Error('request_in_flight');
+      const request = { generation: requestGeneration };
+      this.activeRequest = request;
       let result;
       try {
         result = await this.evalInPage(code);
       } catch (_) {
-        if (generation !== undefined && generation !== this.generation) return null;
+        if (requestGeneration !== this.generation) return null;
         throw new Error('devtools_eval_error');
       } finally {
-        this.requestInFlight = false;
+        if (this.activeRequest === request) this.activeRequest = null;
       }
-      if (generation !== undefined && generation !== this.generation) return null;
+      if (requestGeneration !== this.generation) return null;
       if (!result || typeof result !== 'object') throw new Error('protocol_error');
       return result;
     }

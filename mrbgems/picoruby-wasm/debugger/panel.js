@@ -919,6 +919,10 @@ class PicoRubyDebugger {
       this.profilerBackoff = Math.min(this.profilerBackoff * 2, 5000);
       if (error.message === 'unsupported_schema') this.profilerAvailable = false;
       this.showProfilerError(error.message || 'disconnected');
+      if (!this.profilerAvailable &&
+          ['module_unavailable', 'ccall_error', 'devtools_eval_error'].includes(error.message)) {
+        this.scheduleConnectionRetry(this.profilerBackoff);
+      }
     } finally {
       this.profilerRequestInFlight = false;
       const delay = this.profilerModel.recording ? 500 : 2000;
@@ -980,6 +984,12 @@ class PicoRubyDebugger {
         'Profiler response exceeded 65,535 bytes. Reduce snapshot or attribute limits.'],
       protocol_error: ['Protocol error', 'Malformed profiler response.'],
       invalid_json: ['Protocol error', 'Profiler returned invalid JSON.'],
+      invalid_response: ['Protocol error',
+        'The profiler API returned a non-String response.'],
+      ruby_exception: ['Ruby exception',
+        'The profiler raised while handling the request.'],
+      compile_error: ['Bridge compile error',
+        'PicoRuby could not compile the fixed profiler bridge expression.'],
       module_unavailable: ['Reconnecting',
         'PicoRuby module is unavailable. Reconnecting...'],
       debug_api_unavailable: ['Debug API unavailable',
