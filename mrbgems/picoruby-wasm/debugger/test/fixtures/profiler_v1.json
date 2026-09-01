@@ -2,9 +2,9 @@
   "fixture": {
     "schema_version": 1,
     "source_repository": "ydah/funicular-profiler",
-    "source_revision": "3897b2b61ee2fb86b2aa57dc448f1002f00664092846a321487214e60c228738",
-    "source_revision_kind": "design_document_sha256",
-    "source_status": "unpublished design dated 2026-08-31"
+    "source_revision": "63b9fc725df4c032269675dc80a80fffed172c4d",
+    "source_revision_kind": "git_commit",
+    "source_status": "local integration repository"
   },
   "snapshot": {
     "schema_version": 1,
