@@ -84,12 +84,12 @@ evaluate('class RaiseProfiler < DebugProfiler; def snapshot_json(a,l); raise "bo
 assert.equal(snapshot(0, 1).error, 'ruby_exception');
 assert.equal(control('status').ok, true, 'Ruby exception state was not cleared');
 evaluate(`class BorderProfiler < DebugProfiler
-  def snapshot_json(a,l); '"' + 'x'*65533 + '"'; end
+  def snapshot_json(a,l); '"' + 'x'*65532 + '"'; end
 end
 $__funicular_profiler__=BorderProfiler.new`);
-assert.equal(snapshot(0, 1).length, 65533);
+assert.equal(snapshot(0, 1).length, 65532);
 evaluate(`class LargeProfiler < DebugProfiler
-  def snapshot_json(a,l); '"' + 'x'*65534 + '"'; end
+  def snapshot_json(a,l); '"' + 'x'*65533 + '"'; end
 end
 $__funicular_profiler__=LargeProfiler.new`);
 assert.equal(snapshot(0, 1).error, 'response_too_large');

@@ -49,6 +49,7 @@
 
     clearLocal() {
       this.schemaVersion = 1;
+      this.profilerVersion = null;
       this.sessionId = null;
       this.recording = false;
       this.cursor = 0;
@@ -61,6 +62,15 @@
       this.cursorGap = false;
       this.clientEvictedCount = 0;
       this.protocolWarningCount = 0;
+    }
+
+    profilerVersionFrom(payload) {
+      if (!Object.prototype.hasOwnProperty.call(payload, 'profiler_version')) return undefined;
+      if (typeof payload.profiler_version !== 'string' ||
+          payload.profiler_version.length === 0 || payload.profiler_version.length > 64) {
+        throw new Error('protocol_error: invalid profiler_version');
+      }
+      return payload.profiler_version;
     }
 
     normalizeRecord(record) {
@@ -125,8 +135,10 @@
         throw new Error('protocol_error: cursor mismatch');
       }
       const sessionId = integer(snapshot.session_id, 'session_id');
+      const profilerVersion = this.profilerVersionFrom(snapshot);
       if (this.sessionId !== null && sessionId !== this.sessionId) {
         this.clearLocal();
+        if (profilerVersion !== undefined) this.profilerVersion = profilerVersion;
         this.sessionId = sessionId;
         this.recording = Boolean(snapshot.recording);
         this.connectionState = 'connected';
@@ -164,6 +176,7 @@
         throw new Error('protocol_error: cursor did not advance');
       }
 
+      if (profilerVersion !== undefined) this.profilerVersion = profilerVersion;
       this.sessionId = sessionId;
       this.recording = Boolean(snapshot.recording);
       if (snapshot.cursor_gap) {
@@ -224,6 +237,7 @@
         throw new Error('protocol_error: summary fields');
       }
       const sessionId = integer(summary.session_id, 'session_id');
+      const profilerVersion = this.profilerVersionFrom(summary);
       const groups = [];
       let warnings = 0;
       let i = 0;
@@ -236,6 +250,7 @@
         i++;
       }
       if (this.sessionId !== null && sessionId !== this.sessionId) this.clearLocal();
+      if (profilerVersion !== undefined) this.profilerVersion = profilerVersion;
       this.sessionId = sessionId;
       this.recording = Boolean(summary.recording);
       this.summaryGroups = groups;
@@ -264,8 +279,8 @@
       const limit = Math.min((options && options.limit) || this.maxVisibleRecords,
                              this.maxVisibleRecords);
       const result = [];
-      let i = this.records.length - 1;
-      while (i >= 0 && result.length < limit) {
+      let i = 0;
+      while (i < this.records.length) {
         const record = this.records[i];
         const component = String(record.attributes['funicular.component.class'] || '').toLowerCase();
         if ((!this.filters.name || record.name.toLowerCase().includes(this.filters.name)) &&
@@ -273,9 +288,11 @@
             (this.filters.status === 'all' || record.status === this.filters.status)) {
           result.push(record);
         }
-        i--;
+        i++;
       }
-      return result;
+      result.sort((left, right) =>
+        left.started_at_us - right.started_at_us || left.seq - right.seq);
+      return result.slice(Math.max(0, result.length - limit));
     }
 
     summaryRows() {
@@ -378,7 +395,7 @@
         incomplete = (this.counters[incompleteCounters[i]] || 0) > 0;
         i++;
       }
-      return Object.assign({
+      const exported = {
         format: 'picoruby-funicular-profile',
         format_version: 1,
         exported_at: new Date().toISOString(),
@@ -390,13 +407,36 @@
           protocol_warning_count: this.protocolWarningCount,
         }),
         records: this.records.slice(),
-      }, metadata || {});
+      };
+      if (this.profilerVersion) exported.profiler_version = this.profilerVersion;
+      if (metadata && typeof metadata.pico_ruby_debugger_version === 'string' &&
+          metadata.pico_ruby_debugger_version.length > 0 &&
+          metadata.pico_ruby_debugger_version.length <= 64) {
+        exported.pico_ruby_debugger_version = metadata.pico_ruby_debugger_version;
+      }
+      return exported;
+    }
+
+    statusText() {
+      if (this.connectionState === 'loading') return 'Loading...';
+      if (this.connectionState === 'reconnecting') return 'Reconnecting...';
+      if (this.connectionState === 'unavailable') return 'Profiler not installed';
+      const dropped = this.counters.dropped_count || 0;
+      return `${this.recording ? 'Recording' : 'Stopped'} · ` +
+        `${this.records.length} records · ${dropped} dropped`;
     }
 
     static formatDuration(microseconds) {
       if (microseconds < 1000) return microseconds + ' µs';
       if (microseconds < 1000000) return (microseconds / 1000).toFixed(2) + ' ms';
       return (microseconds / 1000000).toFixed(2) + ' s';
+    }
+
+    static exportFilename(date) {
+      const iso = (date || new Date()).toISOString();
+      const day = iso.slice(0, 10).replace(/-/g, '');
+      const time = iso.slice(11, 19).replace(/:/g, '');
+      return `funicular-profile-${day}-${time}.json`;
     }
   }
 

@@ -9,6 +9,7 @@
     constructor(evalInPage) {
       this.evalInPage = evalInPage;
       this.generation = 0;
+      this.requestInFlight = false;
     }
 
     resetGeneration() {
@@ -17,12 +18,16 @@
     }
 
     async call(code, generation) {
+      if (this.requestInFlight) throw new Error('request_in_flight');
+      this.requestInFlight = true;
       let result;
       try {
         result = await this.evalInPage(code);
-      } catch (error) {
+      } catch (_) {
         if (generation !== undefined && generation !== this.generation) return null;
-        throw error;
+        throw new Error('devtools_eval_error');
+      } finally {
+        this.requestInFlight = false;
       }
       if (generation !== undefined && generation !== this.generation) return null;
       if (!result || typeof result !== 'object') throw new Error('protocol_error');
@@ -37,8 +42,10 @@
           if (typeof Module.ccall !== 'function' ||
               typeof Module._mrb_funicular_profiler_available === 'undefined')
             return { error: 'debug_api_unavailable' };
-          return { available: Module.ccall(
-            'mrb_funicular_profiler_available', 'number', [], []) === 1 };
+          try {
+            return { available: Module.ccall(
+              'mrb_funicular_profiler_available', 'number', [], []) === 1 };
+          } catch (_) { return { error: 'ccall_error' }; }
         } catch (_) { return { error: 'module_unavailable' }; }
       })()`, generation);
     }
@@ -51,34 +58,62 @@
       const pageSize = Number.isFinite(numericLimit)
         ? Math.max(1, Math.min(200, Math.floor(numericLimit))) : 200;
       return this.call(`(function() {
+        const Module = window.picorubyModule;
+        if (!Module) return { error: 'module_unavailable' };
+        if (typeof Module.ccall !== 'function') return { error: 'debug_api_unavailable' };
+        let json;
         try {
-          const Module = window.picorubyModule;
-          const json = Module.ccall('mrb_funicular_profiler_snapshot', 'string',
+          json = Module.ccall('mrb_funicular_profiler_snapshot', 'string',
             ['number', 'number'], [${cursor}, ${pageSize}]);
-          return JSON.parse(json);
-        } catch (_) { return { error: 'invalid_json' }; }
+        } catch (_) { return { error: 'ccall_error' }; }
+        try { return JSON.parse(json); }
+        catch (_) { return { error: 'invalid_json' }; }
       })()`, generation);
     }
 
     fetchSummary(generation) {
       return this.call(`(function() {
+        const Module = window.picorubyModule;
+        if (!Module) return { error: 'module_unavailable' };
+        if (typeof Module.ccall !== 'function') return { error: 'debug_api_unavailable' };
+        let json;
         try {
-          const Module = window.picorubyModule;
-          const json = Module.ccall('mrb_funicular_profiler_summary', 'string', [], []);
-          return JSON.parse(json);
-        } catch (_) { return { error: 'invalid_json' }; }
+          json = Module.ccall('mrb_funicular_profiler_summary', 'string', [], []);
+        } catch (_) { return { error: 'ccall_error' }; }
+        try { return JSON.parse(json); }
+        catch (_) { return { error: 'invalid_json' }; }
       })()`, generation);
+    }
+
+    async fetchSnapshotPages(afterSeq, generation, applySnapshot) {
+      let cursor = afterSeq;
+      let hasMore = true;
+      let pages = 0;
+      while (hasMore && pages < 5) {
+        const snapshot = await this.fetchSnapshot(cursor, 200, generation);
+        if (!snapshot) return null;
+        if (snapshot.error) throw new Error(snapshot.error);
+        const applied = applySnapshot(snapshot);
+        hasMore = applied.hasMore;
+        cursor = applied.sessionReset ? 0 : snapshot.next_cursor;
+        pages++;
+      }
+      return { hasMore, pages };
     }
 
     control(command, generation) {
       if (!COMMANDS.has(command)) return Promise.reject(new Error('unknown_command'));
       return this.call(`(function() {
+        const Module = window.picorubyModule;
+        if (!Module) return { error: 'module_unavailable' };
+        if (typeof Module.ccall !== 'function') return { error: 'debug_api_unavailable' };
+        let json;
         try {
-          const Module = window.picorubyModule;
-          const json = Module.ccall('mrb_funicular_profiler_control', 'string',
+          json = Module.ccall('mrb_funicular_profiler_control', 'string',
             ['string'], ['${command}']);
-          return JSON.parse(json);
-        } catch (_) { return { error: 'invalid_json' }; }
+        } catch (_) { return { error: 'ccall_error' }; }
+        try { return JSON.parse(json); }
+        catch (_) { return { error: 'invalid_json' }; }
       })()`, generation);
     }
   }
