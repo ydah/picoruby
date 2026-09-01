@@ -4,10 +4,12 @@ on:
   push:
     branches:
       - master
+      - integration
       - ci-test
   pull_request:
     branches:
       - master
+      - integration
 
 env:
   GIT_DISCOVERY_ACROSS_FILESYSTEM: 1
