@@ -11,6 +11,7 @@ applications in the browser.
 - **Local variables** - Inspect all local variables at the current scope
 - **Call stack** - Navigate the Ruby call stack when paused
 - **Component inspector** - Browse the Funicular component tree and inspect state
+- **Funicular Profiler** - Inspect bounded summaries, timeline records, and details
 
 ## Requirements
 
@@ -45,7 +46,7 @@ Switch back to `@latest` before deploying to production.
 Alternatively, build from source:
 
 ```bash
-rake wasm:debug
+rake wasm:build_debug
 ```
 
 ## Installation
@@ -116,6 +117,36 @@ enabled (`$__funicular_debug__ = true`), a **Components** panel appears
 alongside the REPL showing the live component tree. Click any component to
 inspect its state and instance variables.
 
+### Funicular Profiler
+
+Applications that explicitly install `funicular-profiler` expose a versioned,
+local-only snapshot API to debug PicoRuby builds. Open **Profiler** and use
+**Record**, **Stop**, **Clear**, **Refresh**, or **Export**. The panel stops
+profiler polling whenever that view or the DevTools document is hidden.
+
+Summary percentiles describe the bounded browser record window. Cursor-gap and
+dropped-record warnings mean the profile is incomplete. Export excludes the
+page URL and user agent, and the debugger never reads DOM, cookie, storage,
+request-body, state, props, or SQL data for profiling.
+
+Troubleshooting:
+
+- **Profiler not installed** — install/start `funicular-profiler` in the page
+- **Unsupported schema** — update either DevTools or the profiler adapter
+- **Response too large** — reduce profiler snapshot/attribute limits
+- **Disconnected** — reload the inspected page and use **Refresh**
+
+Development checks from the repository root:
+
+```bash
+node --test mrbgems/picoruby-wasm/debugger/test/*.test.cjs
+rake 'test:gems:wasm[picoruby-wasm]'
+CONFIG=picoruby-wasm rake
+node mrbgems/picoruby-wasm/debugger/test/profiler_bridge_integration.mjs \
+  build/picoruby-wasm-test/bin/picoruby.js \
+  build/picoruby-wasm/bin/picoruby.wasm
+```
+
 ## Packaging for Chrome Web Store submission
 
 Run from the PicoRuby repository root:
@@ -145,7 +176,7 @@ Chrome Web Store Developer Dashboard.
 > - Inspect local variables and navigate the call stack while paused
 > - Browse the Funicular component tree and inspect component state
 >
-> Requirements: PicoRuby.WASM debug build (rake wasm:debug). Release builds are not supported.
+> Requirements: PicoRuby.WASM debug build (`rake wasm:build_debug`). Release builds are not supported.
 >
 > Open source: https://github.com/picoruby/picoruby
 

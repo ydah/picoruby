@@ -15,9 +15,32 @@ class PicoRubyDebugger {
     this.componentTree = document.getElementById('componentTree');
     this.componentInspector = document.getElementById('componentInspector');
 
+    // Profiler elements and bounded client state
+    this.consoleView = document.getElementById('consoleView');
+    this.profilerView = document.getElementById('profilerView');
+    this.consoleTab = document.getElementById('consoleTab');
+    this.profilerTab = document.getElementById('profilerTab');
+    this.consoleControls = document.getElementById('consoleControls');
+    this.profilerStatus = document.getElementById('profilerStatus');
+    this.profilerBanner = document.getElementById('profilerBanner');
+    this.profilerSummaryBody = document.getElementById('profilerSummaryBody');
+    this.profilerTimelineBody = document.getElementById('profilerTimelineBody');
+    this.profilerDetails = document.getElementById('profilerDetails');
+    this.profilerModel = new PicoRubyProfilerModel.ProfilerModel();
+    this.profilerTransport = new PicoRubyProfilerTransport.ProfilerTransport(
+      code => this.evalInPage(code)
+    );
+    this.activeView = 'console';
+    this.profilerAvailable = false;
+    this.profilerPollTimer = null;
+    this.profilerRequestInFlight = false;
+    this.profilerBackoff = 500;
+    this.lastProfilerError = null;
+
     this.isPaused = false;
     this.pauseId = -1;
     this.isConnected = false;
+    this.connectionRetryTimer = null;
     this.debugPollInterval = null;
     this.selectedComponentId = null;
     this.expandedComponents = new Set();
@@ -33,6 +56,7 @@ class PicoRubyDebugger {
 
     this.setupEventListeners();
     this.setupDebugButtons();
+    this.setupProfiler();
     this.setupResizeHandles();
     this.createInputLine();
     this.checkConnection();
@@ -213,6 +237,106 @@ class PicoRubyDebugger {
     this.btnNext.addEventListener('click', () => this.debugNext());
   }
 
+  setupProfiler() {
+    this.consoleTab.addEventListener('click', () => this.switchView('console'));
+    this.profilerTab.addEventListener('click', () => this.switchView('profiler'));
+    document.getElementById('profilerRecord').addEventListener('click', () => {
+      this.controlProfiler(this.profilerModel.recording ? 'stop' : 'start');
+    });
+    document.getElementById('profilerClear').addEventListener('click', () => {
+      this.controlProfiler('clear');
+    });
+    document.getElementById('profilerRefresh').addEventListener('click', () => {
+      this.refreshProfiler(true);
+    });
+    document.getElementById('profilerExport').addEventListener('click', () => {
+      this.exportProfiler();
+    });
+
+    const updateFilters = () => {
+      this.profilerModel.setFilters({
+        name: document.getElementById('profilerNameFilter').value,
+        component: document.getElementById('profilerComponentFilter').value,
+        status: document.getElementById('profilerStatusFilter').value,
+      });
+      this.renderProfilerTimeline();
+    };
+    document.getElementById('profilerNameFilter').addEventListener('input', updateFilters);
+    document.getElementById('profilerComponentFilter').addEventListener('input', updateFilters);
+    document.getElementById('profilerStatusFilter').addEventListener('change', updateFilters);
+
+    this.profilerView.querySelectorAll('[data-sort]').forEach(header => {
+      header.tabIndex = 0;
+      header.setAttribute('role', 'button');
+      const sort = () => {
+        const by = header.dataset.sort;
+        const direction = this.profilerModel.sort.by === by &&
+          this.profilerModel.sort.direction === 'desc' ? 'asc' : 'desc';
+        this.profilerModel.setSort(by, direction);
+        this.updateProfilerSortHeaders();
+        this.renderProfilerSummary();
+      };
+      header.addEventListener('click', sort);
+      header.addEventListener('keydown', event => {
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault();
+          sort();
+        }
+      });
+    });
+    this.updateProfilerSortHeaders();
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible') this.scheduleProfilerPoll(0);
+      else this.stopProfilerPolling();
+    });
+    if (chrome.devtools.network && chrome.devtools.network.onNavigated) {
+      chrome.devtools.network.onNavigated.addListener(() => {
+        this.handleInspectedNavigation();
+      });
+    }
+    window.addEventListener('unload', () => this.stopProfilerPolling());
+  }
+
+  handleInspectedNavigation() {
+    this.profilerTransport.resetGeneration();
+    this.stopProfilerPolling();
+    this.profilerModel.clearLocal();
+    this.profilerAvailable = false;
+    this.profilerTab.disabled = true;
+    this.isConnected = false;
+    this.stopDebugPolling();
+    if (this.autoRefreshInterval) clearInterval(this.autoRefreshInterval);
+    this.autoRefreshInterval = null;
+    this.updateStatus('Reconnecting...');
+    this.renderProfiler();
+    this.scheduleConnectionRetry(100);
+  }
+
+  scheduleConnectionRetry(delay) {
+    if (this.connectionRetryTimer) clearTimeout(this.connectionRetryTimer);
+    this.connectionRetryTimer = setTimeout(() => {
+      this.connectionRetryTimer = null;
+      this.checkConnection();
+    }, delay);
+  }
+
+  switchView(view) {
+    this.activeView = view;
+    const profiler = view === 'profiler';
+    this.consoleView.classList.toggle('hidden-view', profiler);
+    this.profilerView.classList.toggle('hidden-view', !profiler);
+    this.consoleControls.classList.toggle('hidden-view', profiler);
+    this.consoleTab.setAttribute('aria-selected', String(!profiler));
+    this.profilerTab.setAttribute('aria-selected', String(profiler));
+    if (profiler) {
+      document.getElementById('profilerRecord').focus();
+      this.refreshProfiler(true);
+    } else {
+      this.stopProfilerPolling();
+      if (this.inputEditable) this.inputEditable.focus();
+    }
+  }
+
   setDebugButtonsEnabled(enabled) {
     this.btnContinue.disabled = !enabled;
     this.btnStep.disabled = !enabled;
@@ -358,6 +482,7 @@ class PicoRubyDebugger {
       .then(result => {
         if (result === 'undefined') {
           this.updateStatus('PicoRuby Module not found');
+          this.scheduleConnectionRetry(500);
           return;
         }
 
@@ -375,14 +500,24 @@ class PicoRubyDebugger {
           }
 
           this.isConnected = true;
+          if (this.connectionRetryTimer) clearTimeout(this.connectionRetryTimer);
+          this.connectionRetryTimer = null;
+          this.profilerTab.disabled = false;
           this.updateStatus('Connected to PicoRuby');
           this.startDebugPolling();
           this.checkComponentDebugMode();
+          this.profilerTransport.checkProfilerAvailability(
+            this.profilerTransport.generation
+          ).then(profiler => {
+            this.profilerAvailable = Boolean(profiler && profiler.available);
+            if (this.activeView === 'profiler') this.refreshProfiler(true);
+          }).catch(() => {});
         });
       })
       .catch(err => {
         console.error('Connection check error:', err);
         this.updateStatus('Error: ' + err.message);
+        this.scheduleConnectionRetry(500);
       });
   }
 
@@ -717,6 +852,274 @@ class PicoRubyDebugger {
     } else {
       prompt.classList.remove('debug');
     }
+  }
+
+  // -- Funicular profiler --
+
+  canPollProfiler() {
+    return this.activeView === 'profiler' &&
+      document.visibilityState === 'visible' && this.isConnected &&
+      this.profilerAvailable && !this.profilerRequestInFlight;
+  }
+
+  stopProfilerPolling() {
+    if (this.profilerPollTimer) clearTimeout(this.profilerPollTimer);
+    this.profilerPollTimer = null;
+  }
+
+  scheduleProfilerPoll(delay) {
+    this.stopProfilerPolling();
+    if (!this.canPollProfiler()) return;
+    this.profilerPollTimer = setTimeout(() => this.refreshProfiler(false), delay);
+  }
+
+  async refreshProfiler(manual) {
+    if (this.profilerRequestInFlight || this.activeView !== 'profiler') return;
+    this.stopProfilerPolling();
+    this.profilerRequestInFlight = true;
+    const generation = this.profilerTransport.generation;
+    try {
+      const availability = await this.profilerTransport.checkProfilerAvailability(generation);
+      if (!availability) return;
+      if (availability.error) throw new Error(availability.error);
+      this.profilerAvailable = availability.available;
+      if (!this.profilerAvailable) {
+        this.profilerStatus.textContent = 'Profiler not installed';
+        this.setProfilerBanner(
+          'Install and start funicular-profiler in the inspected application.'
+        );
+        return;
+      }
+
+      if (manual || this.profilerModel.sessionId === null) {
+        const summary = await this.profilerTransport.fetchSummary(generation);
+        if (!summary) return;
+        if (summary.error) throw new Error(summary.error);
+        this.profilerModel.applySummary(summary);
+      }
+
+      let page = 0;
+      let hasMore = true;
+      while (hasMore && page < 5) {
+        const snapshot = await this.profilerTransport.fetchSnapshot(
+          this.profilerModel.cursor, 200, generation
+        );
+        if (!snapshot) return;
+        if (snapshot.error) throw new Error(snapshot.error);
+        const applied = this.profilerModel.applySnapshot(snapshot);
+        hasMore = applied.hasMore;
+        page++;
+      }
+      if (hasMore) this.setProfilerBanner('More records are waiting; polling is page-limited.');
+      else this.updateProfilerWarnings();
+      this.profilerBackoff = 500;
+      this.lastProfilerError = null;
+      this.renderProfiler();
+    } catch (error) {
+      this.profilerBackoff = Math.min(this.profilerBackoff * 2, 5000);
+      if (error.message === 'unsupported_schema') this.profilerAvailable = false;
+      this.showProfilerError(error.message || 'disconnected');
+    } finally {
+      this.profilerRequestInFlight = false;
+      const delay = this.profilerModel.recording ? 500 : 2000;
+      this.scheduleProfilerPoll(Math.max(delay, this.profilerBackoff));
+    }
+  }
+
+  async controlProfiler(command) {
+    if (this.profilerRequestInFlight || !this.profilerAvailable) return;
+    this.stopProfilerPolling();
+    this.profilerRequestInFlight = true;
+    const buttons = this.profilerView.querySelectorAll('.profiler-toolbar button');
+    buttons.forEach(button => { button.disabled = true; });
+    if (command === 'clear') this.profilerTransport.resetGeneration();
+    try {
+      const response = await this.profilerTransport.control(
+        command, this.profilerTransport.generation
+      );
+      if (!response) return;
+      if (response.error) throw new Error(response.error);
+      if (command === 'clear') this.profilerModel.clearLocal();
+      if (typeof response.recording === 'boolean') {
+        this.profilerModel.recording = response.recording;
+      }
+    } catch (error) {
+      this.showProfilerError(error.message);
+    } finally {
+      this.profilerRequestInFlight = false;
+      buttons.forEach(button => { button.disabled = false; });
+    }
+    await this.refreshProfiler(true);
+  }
+
+  updateProfilerWarnings() {
+    const counters = this.profilerModel.counters;
+    const warnings = [];
+    if (this.profilerModel.cursorGap) {
+      warnings.push('Cursor gap: older records were overwritten.');
+    }
+    if ((counters.dropped_count || 0) > 0 ||
+        (counters.dropped_in_flight_count || 0) > 0) {
+      warnings.push(`Dropped records: ${counters.dropped_count || 0}; ` +
+        `in-flight: ${counters.dropped_in_flight_count || 0}.`);
+    }
+    if (this.profilerModel.clientEvictedCount > 0) {
+      warnings.push(`Client window evicted ${this.profilerModel.clientEvictedCount} records.`);
+    }
+    if (this.profilerModel.protocolWarningCount > 0) {
+      warnings.push(`Skipped ${this.profilerModel.protocolWarningCount} malformed records.`);
+    }
+    this.setProfilerBanner(warnings.join(' '));
+  }
+
+  showProfilerError(message) {
+    if (message === this.lastProfilerError) return;
+    this.lastProfilerError = message;
+    const errors = {
+      unsupported_schema: ['Unsupported schema',
+        'Unsupported profiler schema. Upgrade PicoRuby DevTools.'],
+      response_too_large: ['Response too large',
+        'Profiler response exceeded 65,535 bytes. Reduce snapshot or attribute limits.'],
+      protocol_error: ['Protocol error', 'Malformed profiler response.'],
+      invalid_json: ['Protocol error', 'Profiler returned invalid JSON.'],
+      profiler_unavailable: ['Profiler not installed',
+        'Install and start funicular-profiler in the inspected application.'],
+    };
+    const key = message.startsWith('protocol_error') ? 'protocol_error' : message;
+    const display = errors[key] || ['Disconnected', 'Profiler error: ' + message];
+    this.profilerStatus.textContent = display[0];
+    this.setProfilerBanner(display[1]);
+  }
+
+  setProfilerBanner(message) {
+    this.profilerBanner.textContent = message;
+    this.profilerBanner.classList.toggle('hidden-view', !message);
+  }
+
+  renderProfiler() {
+    const recording = this.profilerModel.recording;
+    document.getElementById('profilerRecord').textContent = recording ? 'Stop' : 'Record';
+    document.getElementById('profilerRecord').title = recording
+      ? 'Stop recording' : 'Start recording';
+    const dropped = this.profilerModel.counters.dropped_count || 0;
+    this.profilerStatus.textContent = `${recording ? 'Recording' : 'Stopped'} · ` +
+      `${this.profilerModel.records.length} records · ${dropped} dropped`;
+    this.renderProfilerSummary();
+    this.renderProfilerTimeline();
+    if (!this.profilerModel.selectedRecordId) {
+      this.profilerDetails.textContent = 'Select a record';
+    }
+  }
+
+  appendProfilerCell(row, value) {
+    const cell = document.createElement('td');
+    cell.textContent = String(value);
+    row.appendChild(cell);
+  }
+
+  renderProfilerSummary() {
+    const fragment = document.createDocumentFragment();
+    const format = PicoRubyProfilerModel.ProfilerModel.formatDuration;
+    const rows = this.profilerModel.summaryRows();
+    let i = 0;
+    while (i < rows.length) {
+      const group = rows[i];
+      const row = document.createElement('tr');
+      this.appendProfilerCell(row, group.name);
+      this.appendProfilerCell(row, group.component_class || '—');
+      this.appendProfilerCell(row, group.count);
+      this.appendProfilerCell(row, group.error_count);
+      this.appendProfilerCell(row, format(group.total_us));
+      this.appendProfilerCell(row, format(group.average_us));
+      this.appendProfilerCell(row, format(group.max_us));
+      this.appendProfilerCell(row, format(group.p50_us));
+      this.appendProfilerCell(row, format(group.p95_us));
+      this.appendProfilerCell(row, (group.empty_diff_rate * 100).toFixed(1) + '%');
+      fragment.appendChild(row);
+      i++;
+    }
+    this.profilerSummaryBody.replaceChildren(fragment);
+  }
+
+  updateProfilerSortHeaders() {
+    this.profilerView.querySelectorAll('[data-sort]').forEach(header => {
+      header.setAttribute('aria-sort', header.dataset.sort === this.profilerModel.sort.by
+        ? (this.profilerModel.sort.direction === 'asc' ? 'ascending' : 'descending')
+        : 'none');
+    });
+  }
+
+  renderProfilerTimeline() {
+    const fragment = document.createDocumentFragment();
+    const format = PicoRubyProfilerModel.ProfilerModel.formatDuration;
+    const records = this.profilerModel.visibleRecords({ limit: 1000 });
+    let i = 0;
+    while (i < records.length) {
+      const record = records[i];
+      const row = document.createElement('tr');
+      row.className = record.status === 'error' ? 'error' : '';
+      if (record.id === this.profilerModel.selectedRecordId) row.classList.add('selected');
+      this.appendProfilerCell(row, format(record.started_at_us));
+      this.appendProfilerCell(row, format(record.duration_us));
+      this.appendProfilerCell(row, record.name);
+      this.appendProfilerCell(row, record.attributes['funicular.component.class'] || '—');
+      this.appendProfilerCell(row, record.status);
+      this.appendProfilerCell(row, record.parent_id || '—');
+      row.addEventListener('click', () => this.showProfilerDetails(record.id));
+      row.tabIndex = 0;
+      row.addEventListener('keydown', event => {
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault();
+          this.showProfilerDetails(record.id);
+        }
+      });
+      fragment.appendChild(row);
+      i++;
+    }
+    this.profilerTimelineBody.replaceChildren(fragment);
+  }
+
+  showProfilerDetails(id) {
+    const record = this.profilerModel.selectRecord(id);
+    if (!record) {
+      this.profilerDetails.textContent = 'Select a record';
+      return;
+    }
+    const details = {
+      schema_version: record.schema_version,
+      seq: record.seq,
+      id: record.id,
+      parent_id: record.parent_id,
+      kind: record.kind,
+      name: record.name,
+      status: record.status,
+      started_at_us: record.started_at_us,
+      duration_us: record.duration_us,
+      attributes: Object.keys(record.attributes).sort().reduce((result, key) => {
+        result[key] = record.attributes[key];
+        return result;
+      }, Object.create(null)),
+    };
+    this.profilerDetails.textContent = JSON.stringify(details, null, 2);
+    this.renderProfilerTimeline();
+  }
+
+  exportProfiler() {
+    const exported = this.profilerModel.exportObject({
+      profiler_version: 'unknown',
+      pico_ruby_debugger_version: '0.2.1',
+    });
+    const json = JSON.stringify(exported, null, 2);
+    const blob = new Blob([json], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    const stamp = new Date().toISOString().replace(/[-:]/g, '').slice(0, 15);
+    link.download = `funicular-profile-${stamp}.json`;
+    link.href = url;
+    link.click();
+    setTimeout(() => URL.revokeObjectURL(url), 0);
+    this.profilerStatus.textContent = `Exported ${exported.records.length} records · ` +
+      `${blob.size} bytes`;
   }
 
   // -- Helper methods --
