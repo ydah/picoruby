@@ -57,6 +57,22 @@ test('allows only one transport request at a time', async () => {
   assert.deepEqual(await pending, { schema_version: 1 });
 });
 
+test('navigation abandons an old request without clearing the new request slot', async () => {
+  const resolvers = [];
+  const transport = new ProfilerTransport(() =>
+    new Promise(resolve => { resolvers.push(resolve); }));
+  const stale = transport.fetchSummary(transport.generation);
+
+  const generation = transport.resetGeneration();
+  const availability = transport.checkProfilerAvailability(generation);
+  resolvers[0]({ schema_version: 1 });
+  assert.equal(await stale, null);
+  await assert.rejects(transport.fetchSummary(generation), /request_in_flight/);
+
+  resolvers[1]({ available: true });
+  assert.deepEqual(await availability, { available: true });
+});
+
 test('fetches at most five snapshot pages per cycle', async () => {
   const transport = new ProfilerTransport(async () => ({}));
   const cursors = [];
