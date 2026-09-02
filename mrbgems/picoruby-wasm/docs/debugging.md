@@ -141,5 +141,12 @@ The JavaScript calls into the WASM module via `window.picorubyModule.ccall`:
 | `mrb_debug_next` | Step over |
 | `mrb_get_component_debug_info` | Funicular component tree |
 | `mrb_get_component_state_by_id` | Funicular component state |
+| `mrb_funicular_profiler_available` | Detect the profiler protocol at runtime |
+| `mrb_funicular_profiler_snapshot` | Fetch up to 200 records after a cursor |
+| `mrb_funicular_profiler_summary` | Fetch aggregate summary JSON |
+| `mrb_funicular_profiler_control` | Allowlisted start/stop/clear/status control |
 
 The extension polls `mrb_debug_get_status` every 200 ms to detect pause events.
+The profiler functions and their 64 KiB response buffer are exported only by
+debug builds. They accept fixed operations and numeric cursor arguments, not
+arbitrary Ruby code or method names. The DevTools UI is added separately.
