@@ -79,6 +79,43 @@ response = http.get("/path")
 response = http.post("/path", "data")
 ```
 
+## Bounded transport
+
+PicoRuby on POSIX and Pico 2 W supports one monotonic deadline across DNS,
+TCP, TLS, request writes, and response reads. Configure limits before the
+request:
+
+```ruby
+http = Net::HTTP.new("api.example.com", 443)
+http.use_ssl = true
+http.ca_file = "/etc/ssl/cert.pem"
+http.open_timeout = 10
+http.read_timeout = 10
+http.write_timeout = 10
+http.total_timeout = 30
+http.max_request_bytes = 2_048
+http.max_response_header_bytes = 4_096
+http.max_response_body_bytes = 16_384
+http.max_response_line_bytes = 1_024
+
+response = http.get("/data")
+```
+
+Timeouts must be positive `Integer` or `Float` seconds. Byte limits must be
+non-negative `Integer` values. `write_timeout`, `total_timeout`, and all byte
+limits default to `nil`; `open_timeout` and `read_timeout` default to 60.
+
+Bounded HTTPS requires peer verification and an explicit CA file. Transport
+failures expose a fixed `reason` symbol and a `phase` of `before_request` or
+`request_started`; error messages never contain request or response data.
+Redirect responses are returned without being followed. Responses support
+HTTP/1.0 and HTTP/1.1 with strict Content-Length, chunked, or connection-close
+framing. Transfer codings other than a single `chunked` coding and content
+encodings other than `identity` are rejected.
+
+Other ports keep the legacy socket API, but reject the bounded settings with
+`unsupported_transport` until they implement deadline-aware I/O.
+
 ## License
 
 MIT

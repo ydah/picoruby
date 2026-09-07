@@ -13,8 +13,17 @@ module Net
     def each_header: () { (String, String) -> void } -> void
     def set_default_headers: (String host, Integer port) -> void
     def to_s: () -> String
+    def transport_snapshot: (Integer? limit) -> Array[String | Integer]
+    def self.serialize_snapshot: (Array[String | Integer] parts) -> String
+    def self.format_header_name: (String key) -> String
     def response_body_permitted?: () -> bool
     def request_body_permitted?: () -> bool
+    private def checked_string: (untyped value, Symbol part) -> String
+    private def checked_add: (Integer total, Integer amount, Integer? limit) -> Integer
+    private def token_byte?: (Integer byte) -> bool
+    private def validate_token: (String value) -> String
+    private def validate_target: (String target) -> void
+    private def validate_header_value: (String value) -> void
   end
 
   class HTTPRequest < HTTPGenericRequest

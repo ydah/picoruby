@@ -1,5 +1,24 @@
 module Net
+  module HTTPErrorMetadata
+    attr_reader reason: Symbol?
+    attr_reader phase: Symbol?
+    def initialize: (?Symbol? reason, ?Symbol? phase, ?String? detail) -> void
+    def message: () -> String
+  end
+
+  class HTTPTransportError < IOError
+    include HTTPErrorMetadata
+    def self.new: (?Symbol? reason, ?Symbol? phase, ?String? detail) -> HTTPTransportError
+  end
+
+  class HTTPRequestError < ArgumentError
+    include HTTPErrorMetadata
+    def self.new: (?Symbol? reason, ?Symbol? phase, ?String? detail) -> HTTPRequestError
+  end
+
   class HTTPBadResponse < StandardError
+    include HTTPErrorMetadata
+    def self.new: (?Symbol? reason, ?Symbol? phase, ?String? detail) -> HTTPBadResponse
   end
 
   class HTTPResponse
@@ -14,6 +33,7 @@ module Net
     def []: (String key) -> String?
     def []=: (String key, String value) -> String
     def get_fields: (String key) -> Array[String | nil]
+    def __set_header_fields: (Array[[String, String]] fields) -> Array[[String, String]]
     def read_body: () ?{ (String) -> void } -> String?
     def success?: () -> boolish
     def redirect?: () -> boolish
@@ -94,5 +114,39 @@ module Net
   end
 
   class HTTPServiceUnavailable < HTTPServerError
+  end
+
+  class HTTPResponseReader
+    MAX_INTEGER: Integer
+
+    def initialize: (untyped socket, String? request_method, Integer? header_limit, Integer? body_limit, Integer? line_limit, ?untyped context) -> void
+    def read: () -> untyped
+    def parse_single_head: (String head) -> HTTPResponse
+    private def read_final_response: (untyped status, untyped fields) -> HTTPResponse
+    private def read_response_object: (untyped status, untyped fields, String? body) -> HTTPResponse
+    private def read_status_line: () -> untyped
+    private def read_headers: () -> untyped
+    private def parse_header_line: (String line) -> untyped
+    private def read_line: () -> untyped
+    private def add_header_bytes: (Integer amount) -> void
+    private def consume: (Integer amount) -> String
+    private def field_values: (untyped fields, String name) -> Array[String]
+    private def parse_content_length: (Array[String] values) -> Integer
+    private def validate_transfer_encoding: (Array[String] values) -> void
+    private def read_exact_body: (Integer length) -> String
+    private def read_chunked_body: () -> untyped
+    private def parse_chunk_size: (String line) -> Integer
+    private def validate_chunk_extensions: (String line, Integer offset) -> void
+    private def read_trailers: () -> void
+    private def read_close_delimited_body: () -> untyped
+    private def take_data: (Integer maxlen) -> String?
+    private def take_exact: (Integer length) -> String?
+    private def socket_read: (Integer maxlen) -> String?
+    private def socket_probe: () -> untyped
+    private def validate_field_name: (String name) -> void
+    private def validate_field_text: (String value) -> void
+    private def token_byte?: (Integer byte) -> bool
+    private def trim_ows: (String value) -> String
+    private def fail_response: (Symbol reason) -> bot
   end
 end

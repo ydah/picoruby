@@ -1,9 +1,17 @@
 module Net
   class HTTP
+    MAX_TRANSPORT_INTEGER: Integer
+
     attr_accessor address: String
     attr_accessor port: Integer
-    attr_accessor open_timeout: Integer
-    attr_accessor read_timeout: Integer
+    attr_accessor open_timeout: Integer | Float
+    attr_accessor read_timeout: Integer | Float
+    attr_accessor write_timeout: (Integer | Float)?
+    attr_accessor total_timeout: (Integer | Float)?
+    attr_accessor max_request_bytes: Integer?
+    attr_accessor max_response_header_bytes: Integer?
+    attr_accessor max_response_body_bytes: Integer?
+    attr_accessor max_response_line_bytes: Integer?
     attr_accessor use_ssl: bool
     attr_accessor verify_mode: Integer?
     attr_accessor ca_file: String?
@@ -11,7 +19,7 @@ module Net
     attr_reader started: bool
 
     def initialize: (String address, ?Integer? port) -> void
-    def start: () { (HTTP) -> untyped } -> HTTPResponse
+    def start: () { (HTTP) -> untyped } -> HTTP
              | () -> HTTP
     def finish: () -> void
     def active?: () -> bool
@@ -26,7 +34,29 @@ module Net
     def self.get_response: (String uri_or_host, ?String? path, ?Integer? port) -> HTTPResponse
     def self.post_form: (String url, Hash[untyped, untyped] params) -> HTTPResponse
     def use_ssl?: () -> bool
+    private def new_transport_context: () -> HTTPTransportContext
+    private def connect: (HTTPTransportContext context) -> void
+    private def validate_timeout: (untyped value) -> untyped
+    private def validate_size: (untyped value) -> Integer?
+    private def bounded_transport?: () -> boolish
+    private def transport_deadlines?: () -> bool
+    private def serialize_request: (Array[String | Integer] snapshot) -> String
 
-    private def read_response: () -> String
+  end
+
+  class HTTPTransportContext
+    attr_reader max_response_header_bytes: Integer?
+    attr_reader max_response_body_bytes: Integer?
+    attr_reader max_response_line_bytes: Integer?
+    def initialize: (untyped clock, Integer | Float open_timeout, Integer | Float read_timeout, (Integer | Float)? write_timeout, (Integer | Float)? total_timeout, Integer? header_limit, Integer? body_limit, Integer? line_limit) -> void
+    def open_deadline: () -> untyped
+    def check!: (?Symbol phase) -> true
+    def write: (untyped socket, String wire) -> void
+    def read: (untyped socket, Integer maxlen) -> String?
+    def probe: (untyped socket) -> untyped
+    private def deadline_for: (Integer? stage_deadline, Symbol phase, Symbol timeout_reason) -> Integer?
+    private def translate_socket_error: (untyped error, Symbol failed_reason, Symbol timeout_reason) -> bot
+    private def to_us: (Integer | Float seconds) -> Integer
+    private def add_deadline: (Integer now, Integer delta) -> Integer
   end
 end
