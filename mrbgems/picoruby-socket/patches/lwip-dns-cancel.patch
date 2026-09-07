@@ -1,0 +1,175 @@
+diff --git a/src/core/dns.c b/src/core/dns.c
+index 6540f143..4e93156a 100644
+--- a/src/core/dns.c
++++ b/src/core/dns.c
+@@ -387,6 +387,84 @@ dns_getserver(u8_t numdns)
+   }
+ }
+
++/**
++ * @ingroup dns
++ * Cancel a pending DNS request identified by its callback and argument.
++ *
++ * The callback will not be invoked after this function returns. If this is the
++ * last request using a query, the query and its UDP PCB are released as well.
++ * Must be called from the lwIP core context.
++ *
++ * @return 1 if a pending request was cancelled, 0 if no request matched.
++ */
++u8_t
++dns_cancel(dns_found_callback found, void *callback_arg)
++{
++  u8_t i;
++
++  if (found == NULL) {
++    return 0;
++  }
++
++  for (i = 0; i < DNS_MAX_REQUESTS; i++) {
++    if ((dns_requests[i].found == found) &&
++        (dns_requests[i].arg == callback_arg)) {
++      u8_t table_idx;
++      u8_t request_pending = 0;
++#if ((LWIP_DNS_SECURE & LWIP_DNS_SECURE_RAND_SRC_PORT) != 0)
++      u8_t pcb_in_use = 0;
++#endif
++
++#if ((LWIP_DNS_SECURE & LWIP_DNS_SECURE_NO_MULTIPLE_OUTSTANDING) != 0)
++      table_idx = dns_requests[i].dns_table_idx;
++#else
++      table_idx = i;
++#endif
++      dns_requests[i].found = NULL;
++      dns_requests[i].arg = NULL;
++
++#if ((LWIP_DNS_SECURE & LWIP_DNS_SECURE_NO_MULTIPLE_OUTSTANDING) != 0)
++      {
++        u8_t r;
++        for (r = 0; r < DNS_MAX_REQUESTS; r++) {
++          if (dns_requests[r].found &&
++              (dns_requests[r].dns_table_idx == table_idx)) {
++            request_pending = 1;
++            break;
++          }
++        }
++      }
++#endif
++
++      if (!request_pending && (table_idx < DNS_TABLE_SIZE) &&
++          ((dns_table[table_idx].state == DNS_STATE_NEW) ||
++           (dns_table[table_idx].state == DNS_STATE_ASKING))) {
++#if ((LWIP_DNS_SECURE & LWIP_DNS_SECURE_RAND_SRC_PORT) != 0)
++        u8_t table;
++        for (table = 0; table < DNS_TABLE_SIZE; table++) {
++          if ((table != table_idx) &&
++              ((dns_table[table].state == DNS_STATE_NEW) ||
++               (dns_table[table].state == DNS_STATE_ASKING)) &&
++              (dns_table[table].pcb_idx == dns_table[table_idx].pcb_idx)) {
++            pcb_in_use = 1;
++            break;
++          }
++        }
++        if (!pcb_in_use &&
++            (dns_table[table_idx].pcb_idx < DNS_MAX_SOURCE_PORTS)) {
++          udp_remove(dns_pcbs[dns_table[table_idx].pcb_idx]);
++          dns_pcbs[dns_table[table_idx].pcb_idx] = NULL;
++        }
++        dns_table[table_idx].pcb_idx = DNS_MAX_SOURCE_PORTS;
++#endif
++        dns_table[table_idx].state = DNS_STATE_UNUSED;
++      }
++      return 1;
++    }
++  }
++  return 0;
++}
++
+ /**
+  * The DNS resolver client timer - handle retries and timeouts and should
+  * be called every DNS_TMR_INTERVAL milliseconds (every second by default).
+diff --git a/src/include/lwip/dns.h b/src/include/lwip/dns.h
+index 09134154..437185c2 100644
+--- a/src/include/lwip/dns.h
++++ b/src/include/lwip/dns.h
+@@ -111,6 +111,7 @@ err_t            dns_gethostbyname(const char *hostname, ip_addr_t *addr,
+ err_t            dns_gethostbyname_addrtype(const char *hostname, ip_addr_t *addr,
+                                    dns_found_callback found, void *callback_arg,
+                                    u8_t dns_addrtype);
++u8_t             dns_cancel(dns_found_callback found, void *callback_arg);
+ 
+ 
+ #if DNS_LOCAL_HOSTLIST
+diff --git a/test/unit/core/test_dns.c b/test/unit/core/test_dns.c
+index 6789d244..b6f76478 100644
+--- a/test/unit/core/test_dns.c
++++ b/test/unit/core/test_dns.c
+@@ -14,6 +14,14 @@ dns_teardown(void)
+ {
+ }
+ 
++static void
++dns_cancel_callback(const char *name, const ip_addr_t *ipaddr, void *arg)
++{
++  LWIP_UNUSED_ARG(name);
++  LWIP_UNUSED_ARG(ipaddr);
++  (*(int *)arg)++;
++}
++
+ /* Test functions */
+ 
+ START_TEST(test_dns_set_get_server)
+@@ -41,12 +49,40 @@ START_TEST(test_dns_set_get_server)
+ }
+ END_TEST
+ 
++START_TEST(test_dns_cancel_releases_request)
++{
++  int callback_count[2] = { 0, 0 };
++  int i;
++  ip_addr_t addr;
++  ip_addr_t server;
++
++  LWIP_UNUSED_ARG(_i);
++  IP_ADDR4(&server, 192, 0, 2, 1);
++  dns_setserver(0, &server);
++
++  for (i = 0; i < (DNS_TABLE_SIZE * 2); i++) {
++    fail_unless(dns_gethostbyname("pending.example", &addr,
++                                 dns_cancel_callback,
++                                 &callback_count[0]) == ERR_INPROGRESS);
++    fail_unless(dns_gethostbyname("pending.example", &addr,
++                                 dns_cancel_callback,
++                                 &callback_count[1]) == ERR_INPROGRESS);
++    fail_unless(dns_cancel(dns_cancel_callback, &callback_count[0]) == 1);
++    fail_unless(dns_cancel(dns_cancel_callback, &callback_count[0]) == 0);
++    fail_unless(dns_cancel(dns_cancel_callback, &callback_count[1]) == 1);
++  }
++  fail_unless(callback_count[0] == 0);
++  fail_unless(callback_count[1] == 0);
++}
++END_TEST
++
+ /** Create the suite including all tests for this module */
+ Suite *
+ dns_suite(void)
+ {
+   testfunc tests[] = {
+-    TESTFUNC(test_dns_set_get_server)
++    TESTFUNC(test_dns_set_get_server),
++    TESTFUNC(test_dns_cancel_releases_request)
+   };
+   return create_suite("DNS", tests, sizeof(tests)/sizeof(testfunc), dns_setup, dns_teardown);
+ }
+diff --git a/test/unit/lwipopts.h b/test/unit/lwipopts.h
+index 03579ee7..d83e7ccf 100644
+--- a/test/unit/lwipopts.h
++++ b/test/unit/lwipopts.h
+@@ -56,7 +56,7 @@
+ 
+ /* Enable DNS, with random source port to avoid alloc in dns_init */
+ #define LWIP_DNS                        1
+-#define LWIP_DNS_SECURE (LWIP_DNS_SECURE_RAND_XID | LWIP_DNS_SECURE_RAND_SRC_PORT)
++#define LWIP_DNS_SECURE (LWIP_DNS_SECURE_RAND_XID | LWIP_DNS_SECURE_NO_MULTIPLE_OUTSTANDING | LWIP_DNS_SECURE_RAND_SRC_PORT)
+ 
+ /* Minimal changes to opt.h required for tcp unit tests: */
+ #define MEM_SIZE                        17000

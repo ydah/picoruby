@@ -80,6 +80,15 @@ MRuby::Gem::Specification.new('picoruby-socket') do |spec|
       end
     end
 
+    patch_file = "#{dir}/patches/lwip-dns-cancel.patch"
+    if File.exist?(patch_file)
+      patch_applied = `cd #{lwip_dir} && git apply --check #{patch_file} 2>&1`.strip
+      if patch_applied.empty?
+        sh "cd #{lwip_dir} && git apply #{patch_file}"
+        puts "Applied patch: lwip-dns-cancel.patch"
+      end
+    end
+
     spec.cc.defines << 'PICO_CYW43_ARCH_POLL=1'
 
     # Add LwIP include paths

@@ -22,7 +22,6 @@ typedef struct {
   picorb_dns_notify_func notify;
   void *arg;
   uint8_t state;
-  bool abandoned;
 } picorb_dns_request;
 
 static picorb_dns_request dns_requests[PICORB_DNS_REQUEST_COUNT];
@@ -138,9 +137,7 @@ dns_request_callback(const char *name, const ip_addr_t *ip, void *arg)
     ip_addr_set_zero(&request->address);
     request->state = 3;
   }
-  if (request->abandoned) {
-    memset(request, 0, sizeof(*request));
-  } else if (request->notify) {
+  if (request->notify) {
     request->notify(request->arg);
   }
 }
@@ -227,9 +224,11 @@ Net_dns_abandon(void *ptr)
   picorb_dns_request *request = (picorb_dns_request *)ptr;
   if (!request) return;
   if (request->state == 1) {
-    request->abandoned = true;
-    request->notify = NULL;
-    request->arg = NULL;
+    lwip_begin();
+    /* Provided by patches/lwip-dns-cancel.patch. */
+    dns_cancel(dns_request_callback, request);
+    lwip_end();
+    memset(request, 0, sizeof(*request));
   } else {
     memset(request, 0, sizeof(*request));
   }
