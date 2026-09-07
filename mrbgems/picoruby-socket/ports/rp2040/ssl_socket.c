@@ -32,7 +32,6 @@
 /* SSL Context structure */
 struct picorb_ssl_context {
   int verify_mode;
-  struct altcp_tls_config *tls_config;
   const unsigned char *ca_data;
   size_t ca_len;
   const unsigned char *cert_data;
@@ -51,6 +50,8 @@ struct picorb_ssl_socket {
   char *hostname;
   char *connect_hostname;
   int port;
+  struct altcp_tls_config *tls_config;
+  picorb_transport_error_t transport_error;
 };
 
 #ifdef PICORB_DEBUG
@@ -120,6 +121,7 @@ ssl_connected_callback(void *arg, struct altcp_pcb *pcb, err_t err)
     Net_set_last_error("SSL connect callback failed: %s (%d)", lwip_err_name(err), (int)err);
     ssl_sock->state = SSL_STATE_ERROR;
     ssl_sock->connected = false;
+    ssl_sock->transport_error = err == ERR_MEM ? PICORB_TRANSPORT_RESOURCE_EXHAUSTED : PICORB_TRANSPORT_TLS_FAILED;
     picorb_socket_notify_readable(SSLSocket_event_socket(ssl_sock));
     return err;
   }
@@ -142,6 +144,7 @@ ssl_recv_callback(void *arg, struct altcp_pcb *pcb, struct pbuf *pbuf, err_t err
     if (pbuf) pbuf_free(pbuf);
     ssl_sock->state = SSL_STATE_ERROR;
     ssl_sock->connected = false;
+    ssl_sock->transport_error = PICORB_TRANSPORT_READ_FAILED;
     picorb_socket_notify_readable(SSLSocket_event_socket(ssl_sock));
     return err;
   }
@@ -191,6 +194,8 @@ ssl_recv_callback(void *arg, struct altcp_pcb *pcb, struct pbuf *pbuf, err_t err
 static err_t
 ssl_sent_callback(void *arg, struct altcp_pcb *pcb, u16_t len)
 {
+  picorb_ssl_socket_t *ssl_sock = (picorb_ssl_socket_t *)arg;
+  picorb_socket_notify_readable(SSLSocket_event_socket(ssl_sock));
   return ERR_OK;
 }
 
@@ -200,14 +205,31 @@ ssl_err_callback(void *arg, err_t err)
   D("SSL callback: error code=%d", (int)err);
   picorb_ssl_socket_t *ssl_sock = (picorb_ssl_socket_t *)arg;
   if (!ssl_sock) return;
+  bool connecting = ssl_sock->state == SSL_STATE_CONNECTING;
 
   if (!Net_get_last_error()[0]) {
     Net_set_last_error("SSL connection error: %s (%d)", lwip_err_name(err), (int)err);
+  }
+  if (connecting) {
+    if (ssl_sock->transport_error != PICORB_TRANSPORT_TLS_VERIFICATION_FAILED) {
+      ssl_sock->transport_error = PICORB_TRANSPORT_TLS_FAILED;
+    }
+  } else {
+    ssl_sock->transport_error = PICORB_TRANSPORT_READ_FAILED;
   }
   ssl_sock->state = SSL_STATE_ERROR;
   ssl_sock->connected = false;
   ssl_sock->tls_pcb = NULL;  /* PCB is already freed by LwIP */
   picorb_socket_notify_readable(SSLSocket_event_socket(ssl_sock));
+}
+
+void
+SSLSocket_handshake_failed(void *arg, uint32_t verify_result)
+{
+  picorb_ssl_socket_t *ssl_sock = (picorb_ssl_socket_t *)arg;
+  if (ssl_sock && verify_result != 0) {
+    ssl_sock->transport_error = PICORB_TRANSPORT_TLS_VERIFICATION_FAILED;
+  }
 }
 
 static err_t
@@ -230,7 +252,6 @@ SSLContext_create(picorb_state *vm)
 
   memset(ctx, 0, sizeof(picorb_ssl_context_t));
   ctx->verify_mode = SSL_VERIFY_PEER;
-  ctx->tls_config = NULL;
   ctx->ca_data = NULL;
   ctx->ca_len = 0;
   ctx->cert_data = NULL;
@@ -331,11 +352,6 @@ SSLContext_free(picorb_state *vm, picorb_ssl_context_t *ctx)
     return;
   }
 
-  if (ctx->tls_config) {
-    altcp_tls_free_config(ctx->tls_config);
-    ctx->tls_config = NULL;
-  }
-
   picorb_free(vm, ctx);
 }
 
@@ -387,6 +403,8 @@ SSLSocket_create(picorb_state *vm, picorb_ssl_context_t *ssl_ctx)
   ssl_sock->hostname = NULL;
   ssl_sock->connect_hostname = NULL;
   ssl_sock->port = 0;
+  ssl_sock->tls_config = NULL;
+  ssl_sock->transport_error = PICORB_TRANSPORT_OK;
 
   return ssl_sock;
 }
@@ -520,6 +538,7 @@ SSLSocket_connect(picorb_state *vm, picorb_ssl_socket_t *ssl_sock)
   if (!tls_config) {
     D("SSL: TLS config failed");
     Net_set_last_error("SSL TLS config allocation failed");
+    ssl_sock->transport_error = PICORB_TRANSPORT_RESOURCE_EXHAUSTED;
     return false;
   }
   D("SSL: TLS config ok");
@@ -538,15 +557,13 @@ SSLSocket_connect(picorb_state *vm, picorb_ssl_socket_t *ssl_sock)
     D("SSL: TLS PCB failed");
     Net_set_last_error("SSL TLS PCB allocation failed");
     altcp_tls_free_config(tls_config);
+    ssl_sock->transport_error = PICORB_TRANSPORT_RESOURCE_EXHAUSTED;
     return false;
   }
   D("SSL: TLS PCB ok");
 
   /* Store config for cleanup */
-  if (ssl_sock->ssl_ctx->tls_config) {
-    altcp_tls_free_config(ssl_sock->ssl_ctx->tls_config);
-  }
-  ssl_sock->ssl_ctx->tls_config = tls_config;
+  ssl_sock->tls_config = tls_config;
 
   /* Set hostname for SNI */
   D("SSL: setting hostname");
@@ -558,10 +575,21 @@ SSLSocket_connect(picorb_state *vm, picorb_ssl_socket_t *ssl_sock)
     altcp_abort(ssl_sock->tls_pcb);
     lwip_end();
     ssl_sock->tls_pcb = NULL;
+    ssl_sock->tls_config = NULL;
     altcp_tls_free_config(tls_config);
+    ssl_sock->transport_error = PICORB_TRANSPORT_TLS_FAILED;
     return false;
   }
-  mbedtls_ssl_set_hostname(ssl_ctx, ssl_sock->hostname);
+  if (mbedtls_ssl_set_hostname(ssl_ctx, ssl_sock->hostname) != 0) {
+    lwip_begin();
+    altcp_abort(ssl_sock->tls_pcb);
+    lwip_end();
+    ssl_sock->tls_pcb = NULL;
+    ssl_sock->tls_config = NULL;
+    altcp_tls_free_config(tls_config);
+    ssl_sock->transport_error = PICORB_TRANSPORT_TLS_FAILED;
+    return false;
+  }
 
   /* Setup callbacks */
   D("SSL: setting callbacks");
@@ -570,10 +598,6 @@ SSLSocket_connect(picorb_state *vm, picorb_ssl_socket_t *ssl_sock)
   altcp_err(ssl_sock->tls_pcb, ssl_err_callback);
   altcp_poll(ssl_sock->tls_pcb, ssl_poll_callback, 10);
   altcp_arg(ssl_sock->tls_pcb, ssl_sock);
-
-  /* Small delay before connecting */
-  D("SSL: waiting before connect");
-  Net_busy_wait_ms(100);
 
   ssl_sock->state = SSL_STATE_CONNECTING;
 
@@ -587,11 +611,10 @@ SSLSocket_connect(picorb_state *vm, picorb_ssl_socket_t *ssl_sock)
     ssl_sock->state = SSL_STATE_ERROR;
     altcp_abort(ssl_sock->tls_pcb);
     ssl_sock->tls_pcb = NULL;
-    if (ssl_sock->ssl_ctx->tls_config == tls_config) {
-      ssl_sock->ssl_ctx->tls_config = NULL;
-    }
+    ssl_sock->tls_config = NULL;
     altcp_tls_free_config(tls_config);
     lwip_end();
+    ssl_sock->transport_error = PICORB_TRANSPORT_CONNECT_FAILED;
     return false;
   }
   lwip_end();
@@ -623,13 +646,24 @@ SSLSocket_connect(picorb_state *vm, picorb_ssl_socket_t *ssl_sock)
       lwip_end();
       ssl_sock->tls_pcb = NULL;
     }
-    if (ssl_sock->ssl_ctx->tls_config == tls_config) {
-      ssl_sock->ssl_ctx->tls_config = NULL;
-    }
+    ssl_sock->tls_config = NULL;
     altcp_tls_free_config(tls_config);
     ssl_sock->state = SSL_STATE_ERROR;
+    ssl_sock->transport_error = PICORB_TRANSPORT_TLS_TIMEOUT;
     return false;
   }
+}
+
+bool
+SSLSocket_connect_deadline(picorb_state *vm, picorb_ssl_socket_t *ssl_sock,
+                           int64_t deadline_us)
+{
+  (void)deadline_us;
+  bool result = SSLSocket_connect(vm, ssl_sock);
+  if (!result && ssl_sock && ssl_sock->transport_error == PICORB_TRANSPORT_OK) {
+    ssl_sock->transport_error = PICORB_TRANSPORT_TLS_FAILED;
+  }
+  return result;
 }
 
 int
@@ -652,6 +686,7 @@ SSLSocket_finish_connect(picorb_state *vm, picorb_ssl_socket_t *ssl_sock)
   ssl_sock->base_socket->recv_buf = (char *)picorb_alloc(vm, SSL_RECV_BUF_SIZE + 1);
   if (!ssl_sock->base_socket->recv_buf) {
     Net_set_last_error("SSL recv buffer allocation failed");
+    ssl_sock->transport_error = PICORB_TRANSPORT_RESOURCE_EXHAUSTED;
     return false;
   }
   ssl_sock->base_socket->recv_capacity = SSL_RECV_BUF_SIZE;
@@ -688,6 +723,45 @@ SSLSocket_send(picorb_state *vm, picorb_ssl_socket_t *ssl_sock, const void *data
   }
 
   return (ssize_t)len;
+}
+
+ssize_t
+SSLSocket_send_deadline(picorb_state *vm, picorb_ssl_socket_t *ssl_sock,
+                        const void *data, size_t len, int64_t deadline_us)
+{
+  (void)vm;
+  (void)deadline_us;
+  if (!ssl_sock || !ssl_sock->connected || !ssl_sock->tls_pcb || !data) {
+    if (ssl_sock) ssl_sock->transport_error = PICORB_TRANSPORT_WRITE_FAILED;
+    return -1;
+  }
+  lwip_begin();
+  u16_t available = altcp_sndbuf(ssl_sock->tls_pcb);
+  if (available == 0) {
+    lwip_end();
+    ssl_sock->base_socket->event_pending = false;
+    return PICORB_SEND_WOULD_BLOCK;
+  }
+  size_t accepted = len;
+  if (accepted > available) accepted = available;
+  if (accepted > 1024) accepted = 1024;
+  err_t error = altcp_write(ssl_sock->tls_pcb, data, (u16_t)accepted, TCP_WRITE_FLAG_COPY);
+  if (error != ERR_OK) {
+    lwip_end();
+    if (error == ERR_MEM || error == ERR_WOULDBLOCK) {
+      ssl_sock->base_socket->event_pending = false;
+      return PICORB_SEND_WOULD_BLOCK;
+    }
+    ssl_sock->transport_error = PICORB_TRANSPORT_WRITE_FAILED;
+    return -1;
+  }
+  error = altcp_output(ssl_sock->tls_pcb);
+  lwip_end();
+  if (error != ERR_OK) {
+    ssl_sock->transport_error = PICORB_TRANSPORT_WRITE_FAILED;
+    return PICORB_SEND_ACCEPTED_FAILED;
+  }
+  return (ssize_t)accepted;
 }
 
 ssize_t
@@ -741,6 +815,40 @@ SSLSocket_recv(picorb_state *vm, picorb_ssl_socket_t *ssl_sock, void *buf, size_
   return (ssize_t)to_copy;
 }
 
+ssize_t
+SSLSocket_recv_deadline(picorb_state *vm, picorb_ssl_socket_t *ssl_sock,
+                        void *buf, size_t len, int64_t deadline_us)
+{
+  (void)deadline_us;
+  ssize_t result = SSLSocket_recv(vm, ssl_sock, buf, len, true);
+  if (result < 0 && result != PICORB_RECV_WOULD_BLOCK && ssl_sock) {
+    ssl_sock->transport_error = PICORB_TRANSPORT_READ_FAILED;
+  }
+  return result;
+}
+
+int
+SSLSocket_eof_probe(picorb_state *vm, picorb_ssl_socket_t *ssl_sock,
+                    int64_t deadline_us)
+{
+  (void)vm;
+  (void)deadline_us;
+  if (!ssl_sock || !ssl_sock->base_socket || ssl_sock->state == SSL_STATE_ERROR) {
+    if (ssl_sock) ssl_sock->transport_error = PICORB_TRANSPORT_READ_FAILED;
+    return PICORB_PROBE_ERROR;
+  }
+  if (ssl_sock->base_socket->recv_len > 0) return PICORB_PROBE_DATA;
+  if (!ssl_sock->connected) return PICORB_PROBE_EOF;
+  ssl_sock->base_socket->event_pending = false;
+  return PICORB_PROBE_WOULD_BLOCK;
+}
+
+picorb_transport_error_t
+SSLSocket_transport_error(picorb_ssl_socket_t *ssl_sock)
+{
+  return ssl_sock ? ssl_sock->transport_error : PICORB_TRANSPORT_READ_FAILED;
+}
+
 bool
 SSLSocket_close(picorb_state *vm, picorb_ssl_socket_t *ssl_sock)
 {
@@ -763,13 +871,11 @@ SSLSocket_close(picorb_state *vm, picorb_ssl_socket_t *ssl_sock)
 
     ssl_sock->tls_pcb = NULL;
 
-    if (ssl_sock->ssl_ctx && ssl_sock->ssl_ctx->tls_config) {
-      altcp_tls_free_config(ssl_sock->ssl_ctx->tls_config);
-      ssl_sock->ssl_ctx->tls_config = NULL;
-    }
-  } else if (ssl_sock->ssl_ctx && ssl_sock->ssl_ctx->tls_config) {
-    altcp_tls_free_config(ssl_sock->ssl_ctx->tls_config);
-    ssl_sock->ssl_ctx->tls_config = NULL;
+  }
+
+  if (ssl_sock->tls_config) {
+    altcp_tls_free_config(ssl_sock->tls_config);
+    ssl_sock->tls_config = NULL;
   }
 
   if (ssl_sock->hostname) {

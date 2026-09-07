@@ -31,32 +31,63 @@ class SSLSocket < BasicSocket
 
   if Object.const_defined?(:SocketDNSResolver)
     def self.open(host, port, ssl_context)
-      socket = __open_poll(host, port, ssl_context)
-      socket.connect
-      socket
+      __open_with_deadline(host, port, ssl_context, nil)
     end
 
-    def connect
+    def self.__transport_open(host, port, ssl_context, deadline)
+      __open_with_deadline(host, port, ssl_context, deadline)
+    end
+
+    def self.__open_with_deadline(host, port, ssl_context, deadline)
+      socket = __open_poll(host, port, ssl_context)
+      connected = false
+      begin
+        socket.connect(deadline)
+        connected = true
+        socket
+      ensure
+        unless connected
+          begin
+            socket.close
+          rescue
+          end
+        end
+      end
+    end
+
+    def connect(deadline = nil)
       host = remote_host
-      resolved_host = SocketDNSResolver.resolve_host(host)
+      resolved_host = SocketDNSResolver.resolve_host(host, deadline)
       __set_connect_hostname(resolved_host)
+      BasicSocket.__remaining_timeout_ms(deadline, :tls_timeout) if deadline
       __connect_poll
       event_queue = @event_queue
       return self unless event_queue
 
       while __connection_state == 1
-        __wait_for_event(event_queue, "SSL handshake timed out")
+        if deadline
+          timeout_ms = BasicSocket.__remaining_timeout_ms(deadline, :tls_timeout)
+          unless event_queue.pop(timeout_ms: timeout_ms)
+            close
+            raise SocketTransportError.new(:tls_timeout)
+          end
+        else
+          __wait_for_event(event_queue, "SSL handshake timed out")
+        end
       end
 
       if __connection_state == 2
         return self if __finish_connect
 
         close
+        raise SocketTransportError.new(:resource_exhausted) if deadline
         raise SocketError, "SSL receive buffer allocation failed"
       end
 
       message = __error_message
+      reason = deadline ? __transport_error_reason : :tls_failed
       close
+      raise SocketTransportError.new(reason) if deadline
       raise SocketError, message || "SSL handshake failed"
     end
 

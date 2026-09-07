@@ -3,19 +3,29 @@ class TCPSocket < BasicSocket
   # This file provides additional Ruby-level methods
 
   if Object.const_defined?(:SocketDNSResolver)
-    def initialize(host, port)
-      host = SocketDNSResolver.resolve_host(host)
+    def initialize(host, port, deadline = nil)
+      host = SocketDNSResolver.resolve_host(host, deadline)
+      BasicSocket.__remaining_timeout_ms(deadline, :connect_timeout) if deadline
       __initialize_poll(host, port)
       event_queue = @event_queue
       return unless event_queue
 
       while __connection_state == 1
-        __wait_for_event(event_queue, "connection timed out")
+        if deadline
+          timeout_ms = BasicSocket.__remaining_timeout_ms(deadline, :connect_timeout)
+          unless event_queue.pop(timeout_ms: timeout_ms)
+            close
+            raise SocketTransportError.new(:connect_timeout)
+          end
+        else
+          __wait_for_event(event_queue, "connection timed out")
+        end
       end
       return if __connection_state == 2
 
       message = __error_message
       close
+      raise SocketTransportError.new(:connect_failed) if deadline
       raise SocketError, message || "failed to connect"
     end
   end
@@ -24,6 +34,12 @@ class TCPSocket < BasicSocket
 
   def self.open(host, port)
     new(host, port)
+  end
+
+  if const_defined?(:TRANSPORT_DEADLINES)
+    def self.__transport_open(host, port, deadline)
+      new(host, port, deadline)
+    end
   end
 
   def self.gethostbyname(host)

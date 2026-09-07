@@ -19,6 +19,37 @@ const struct mrb_data_type mrb_socket_type = {
   "Socket", mrb_socket_free,
 };
 
+const char *
+picorb_transport_error_reason(picorb_transport_error_t error)
+{
+  switch (error) {
+    case PICORB_TRANSPORT_DNS_TIMEOUT: return "dns_timeout";
+    case PICORB_TRANSPORT_DNS_FAILED: return "dns_failed";
+    case PICORB_TRANSPORT_CONNECT_TIMEOUT: return "connect_timeout";
+    case PICORB_TRANSPORT_CONNECT_FAILED: return "connect_failed";
+    case PICORB_TRANSPORT_TLS_TIMEOUT: return "tls_timeout";
+    case PICORB_TRANSPORT_TLS_VERIFICATION_FAILED: return "tls_verification_failed";
+    case PICORB_TRANSPORT_TLS_FAILED: return "tls_failed";
+    case PICORB_TRANSPORT_WRITE_TIMEOUT: return "write_timeout";
+    case PICORB_TRANSPORT_WRITE_FAILED: return "write_failed";
+    case PICORB_TRANSPORT_READ_TIMEOUT: return "read_timeout";
+    case PICORB_TRANSPORT_READ_FAILED: return "read_failed";
+    case PICORB_TRANSPORT_RESOURCE_EXHAUSTED: return "resource_exhausted";
+    case PICORB_TRANSPORT_UNSUPPORTED: return "unsupported_transport";
+    default: return "timeout";
+  }
+}
+
+void
+picorb_raise_transport_error(mrb_state *mrb, picorb_transport_error_t error)
+{
+  const char *reason = picorb_transport_error_reason(error);
+  struct RClass *klass = mrb_class_get_id(mrb, mrb_intern_lit(mrb, "SocketTransportError"));
+  mrb_value arg = mrb_symbol_value(mrb_intern_cstr(mrb, reason));
+  mrb_value exception = mrb_obj_new(mrb, klass, 1, &arg);
+  mrb_exc_raise(mrb, exception);
+}
+
 #ifdef PICO_CYW43_ARCH_POLL
 void
 picorb_task_queue_notify(mrb_state *mrb, void *queue_ptr, bool *pending)

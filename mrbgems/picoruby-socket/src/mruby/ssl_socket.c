@@ -11,6 +11,9 @@
 
 #define E_SOCKET_ERROR (mrb_class_get_id(mrb, MRB_SYM(SocketError)))
 #define E_EOF_ERROR    (mrb_class_get_id(mrb, MRB_SYM(EOFError)))
+#if defined(PICORB_PLATFORM_POSIX) || defined(PICO_CYW43_ARCH_POLL)
+#define PICORB_TRANSPORT_DEADLINES 1
+#endif
 
 /* Data type for SSLContext */
 static void
@@ -200,12 +203,12 @@ mrb_ssl_context_set_pem(mrb_state *mrb, mrb_value self, mrb_sym ivar_sym,
   }
 
   mrb_get_args(mrb, "S", &str);
-  mrb_iv_set(mrb, self, ivar_sym, str);
 
   if (!setter(mrb, ctx, RSTRING_PTR(str), (size_t)RSTRING_LEN(str))) {
     mrb_raise(mrb, E_RUNTIME_ERROR, error_message);
   }
 
+  mrb_iv_set(mrb, self, ivar_sym, str);
   return mrb_nil_value();
 }
 
@@ -359,8 +362,13 @@ mrb_ssl_socket_s_open(mrb_state *mrb, mrb_value klass)
   mrb_value ssl_context_obj;
   picorb_ssl_context_t *ssl_ctx;
   picorb_ssl_socket_t *ssl_sock;
+  mrb_int deadline_us = 0;
 
+#ifdef PICORB_TRANSPORT_DEADLINES
+  mrb_get_args(mrb, "zio|i", &hostname, &port, &ssl_context_obj, &deadline_us);
+#else
   mrb_get_args(mrb, "zio", &hostname, &port, &ssl_context_obj);
+#endif
 
   ssl_ctx = (picorb_ssl_context_t *)mrb_data_get_ptr(mrb, ssl_context_obj, &mrb_ssl_context_type);
   if (!ssl_ctx) {
@@ -391,7 +399,12 @@ mrb_ssl_socket_s_open(mrb_state *mrb, mrb_value klass)
   picorb_socket_attach_event_queue(mrb, &self, SSLSocket_event_socket(ssl_sock));
   return self;
 #else
-  if (!SSLSocket_connect(mrb, ssl_sock)) {
+#ifdef PICORB_TRANSPORT_DEADLINES
+  bool connected = SSLSocket_connect_deadline(mrb, ssl_sock, (int64_t)deadline_us);
+#else
+  bool connected = SSLSocket_connect(mrb, ssl_sock);
+#endif
+  if (!connected) {
 #if !defined(PICORB_PLATFORM_POSIX) && !defined(PICORB_PLATFORM_ESP32)
     const char *net_error = Net_get_last_error();
     if (net_error && net_error[0]) {
@@ -399,7 +412,13 @@ mrb_ssl_socket_s_open(mrb_state *mrb, mrb_value klass)
       mrb_raise(mrb, E_RUNTIME_ERROR, net_error);
     }
 #endif
+#ifdef PICORB_TRANSPORT_DEADLINES
+    picorb_transport_error_t transport_error = SSLSocket_transport_error(ssl_sock);
+#endif
     SSLSocket_close(mrb, ssl_sock);
+#ifdef PICORB_TRANSPORT_DEADLINES
+    if (deadline_us > 0) picorb_raise_transport_error(mrb, transport_error);
+#endif
     mrb_raise(mrb, E_RUNTIME_ERROR, "SSL connection failed");
   }
 
@@ -413,6 +432,90 @@ mrb_ssl_socket_s_open(mrb_state *mrb, mrb_value klass)
   return self;
 #endif
 }
+
+#ifdef PICORB_TRANSPORT_DEADLINES
+static int64_t
+mrb_ssl_transport_deadline(mrb_state *mrb, mrb_value value)
+{
+  if (mrb_nil_p(value)) return 0;
+  if (!mrb_integer_p(value)) mrb_raise(mrb, E_ARGUMENT_ERROR, "deadline must be an Integer or nil");
+  mrb_int deadline = mrb_integer(value);
+  if (deadline < 0) mrb_raise(mrb, E_ARGUMENT_ERROR, "deadline must not be negative");
+  return (int64_t)deadline;
+}
+
+static mrb_value
+mrb_ssl_socket_transport_write(mrb_state *mrb, mrb_value self)
+{
+  picorb_ssl_socket_t *ssl_sock = (picorb_ssl_socket_t *)mrb_data_get_ptr(mrb, self, &mrb_ssl_socket_type);
+  mrb_value data, deadline_value;
+  mrb_int offset, length;
+  mrb_get_args(mrb, "Siio", &data, &offset, &length, &deadline_value);
+  if (!ssl_sock || offset < 0 || length < 0 || offset > RSTRING_LEN(data) ||
+      length > RSTRING_LEN(data) - offset) {
+    mrb_raise(mrb, E_ARGUMENT_ERROR, "invalid transport write range");
+  }
+  ssize_t sent = SSLSocket_send_deadline(
+    mrb, ssl_sock, RSTRING_PTR(data) + offset, (size_t)length,
+    mrb_ssl_transport_deadline(mrb, deadline_value));
+  if (sent == PICORB_SEND_WOULD_BLOCK) return mrb_nil_value();
+  if (sent < 0) picorb_raise_transport_error(mrb, SSLSocket_transport_error(ssl_sock));
+  return mrb_fixnum_value((mrb_int)sent);
+}
+
+static mrb_value
+mrb_ssl_socket_transport_read(mrb_state *mrb, mrb_value self)
+{
+  picorb_ssl_socket_t *ssl_sock = (picorb_ssl_socket_t *)mrb_data_get_ptr(mrb, self, &mrb_ssl_socket_type);
+  mrb_int maxlen;
+  mrb_value deadline_value;
+  mrb_get_args(mrb, "io", &maxlen, &deadline_value);
+  if (!ssl_sock || maxlen <= 0) mrb_raise(mrb, E_ARGUMENT_ERROR, "maxlen must be positive");
+  char stack_buf[PICORB_SOCKET_STACK_BUF_SIZE];
+  char *read_buf = maxlen < PICORB_SOCKET_STACK_BUF_SIZE ? stack_buf : (char *)mrb_malloc(mrb, (size_t)maxlen);
+  ssize_t received = SSLSocket_recv_deadline(
+    mrb, ssl_sock, read_buf, (size_t)maxlen,
+    mrb_ssl_transport_deadline(mrb, deadline_value));
+  if (received == PICORB_RECV_WOULD_BLOCK) {
+    if (read_buf != stack_buf) mrb_free(mrb, read_buf);
+    return mrb_nil_value();
+  }
+  if (received == 0) {
+    if (read_buf != stack_buf) mrb_free(mrb, read_buf);
+    mrb_raise(mrb, E_EOF_ERROR, "end of file reached");
+  }
+  if (received < 0) {
+    if (read_buf != stack_buf) mrb_free(mrb, read_buf);
+    picorb_raise_transport_error(mrb, SSLSocket_transport_error(ssl_sock));
+  }
+  mrb_value result = mrb_str_new(mrb, read_buf, received);
+  if (read_buf != stack_buf) mrb_free(mrb, read_buf);
+  return result;
+}
+
+static mrb_value
+mrb_ssl_socket_transport_eof_probe(mrb_state *mrb, mrb_value self)
+{
+  picorb_ssl_socket_t *ssl_sock = (picorb_ssl_socket_t *)mrb_data_get_ptr(mrb, self, &mrb_ssl_socket_type);
+  mrb_value deadline_value;
+  mrb_get_args(mrb, "o", &deadline_value);
+  if (!ssl_sock) mrb_raise(mrb, E_RUNTIME_ERROR, "SSL socket is not initialized");
+  int result = SSLSocket_eof_probe(
+    mrb, ssl_sock, mrb_ssl_transport_deadline(mrb, deadline_value));
+  if (result == PICORB_PROBE_ERROR) {
+    picorb_raise_transport_error(mrb, SSLSocket_transport_error(ssl_sock));
+  }
+  return mrb_fixnum_value(result);
+}
+
+static mrb_value
+mrb_ssl_socket_transport_error_reason(mrb_state *mrb, mrb_value self)
+{
+  picorb_ssl_socket_t *ssl_sock = (picorb_ssl_socket_t *)mrb_data_get_ptr(mrb, self, &mrb_ssl_socket_type);
+  return mrb_symbol_value(mrb_intern_cstr(
+    mrb, picorb_transport_error_reason(SSLSocket_transport_error(ssl_sock))));
+}
+#endif
 
 /* ssl_socket.connect */
 static mrb_value
@@ -732,15 +835,21 @@ ssl_socket_init(mrb_state *mrb, struct RClass *basic_socket_class)
   /* SSLSocket class */
   ssl_socket_class = mrb_define_class_id(mrb, MRB_SYM(SSLSocket), basic_socket_class);
   MRB_SET_INSTANCE_TT(ssl_socket_class, MRB_TT_DATA);
+#ifdef PICORB_TRANSPORT_DEADLINES
+  mrb_define_const(mrb, ssl_socket_class, "TRANSPORT_DEADLINES", mrb_true_value());
+#endif
 
   mrb_define_method_id(mrb, ssl_socket_class, MRB_SYM(initialize), mrb_ssl_socket_initialize, MRB_ARGS_REQ(2));
 #ifdef PICO_CYW43_ARCH_POLL
   mrb_define_class_method(mrb, ssl_socket_class, "__open_poll", mrb_ssl_socket_s_open, MRB_ARGS_REQ(3));
 #else
   mrb_define_class_method_id(mrb, ssl_socket_class, MRB_SYM(open), mrb_ssl_socket_s_open, MRB_ARGS_REQ(3));
+#ifdef PICORB_TRANSPORT_DEADLINES
+  mrb_define_class_method(mrb, ssl_socket_class, "__transport_open", mrb_ssl_socket_s_open, MRB_ARGS_REQ(4));
+#endif
 #endif
 #ifdef PICO_CYW43_ARCH_POLL
-  mrb_define_private_method_id(mrb, ssl_socket_class,
+  mrb_define_method_id(mrb, ssl_socket_class,
                                MRB_SYM(__set_connect_hostname),
                                mrb_ssl_socket_set_connect_hostname,
                                MRB_ARGS_REQ(1));
@@ -752,6 +861,29 @@ ssl_socket_init(mrb_state *mrb, struct RClass *basic_socket_class)
 #else
   mrb_define_method_id(mrb, ssl_socket_class, MRB_SYM(connect), mrb_ssl_socket_connect, MRB_ARGS_NONE());
   mrb_define_method_id(mrb, ssl_socket_class, MRB_SYM(readpartial), mrb_ssl_socket_readpartial, MRB_ARGS_REQ(1));
+#endif
+#ifdef PICORB_TRANSPORT_DEADLINES
+#ifdef PICO_CYW43_ARCH_POLL
+  mrb_define_private_method_id(mrb, ssl_socket_class,
+                               mrb_intern_lit(mrb, "__transport_write_poll"),
+#else
+  mrb_define_method_id(mrb, ssl_socket_class,
+                               mrb_intern_lit(mrb, "__transport_write"),
+#endif
+                               mrb_ssl_socket_transport_write, MRB_ARGS_REQ(4));
+#ifdef PICO_CYW43_ARCH_POLL
+  mrb_define_private_method_id(mrb, ssl_socket_class, mrb_intern_lit(mrb, "__transport_read_poll"),
+                               mrb_ssl_socket_transport_read, MRB_ARGS_REQ(2));
+  mrb_define_private_method_id(mrb, ssl_socket_class, mrb_intern_lit(mrb, "__transport_eof_probe_poll"),
+                               mrb_ssl_socket_transport_eof_probe, MRB_ARGS_REQ(1));
+  mrb_define_private_method_id(mrb, ssl_socket_class, mrb_intern_lit(mrb, "__transport_error_reason"),
+                               mrb_ssl_socket_transport_error_reason, MRB_ARGS_NONE());
+#else
+  mrb_define_method_id(mrb, ssl_socket_class, mrb_intern_lit(mrb, "__transport_read"),
+                               mrb_ssl_socket_transport_read, MRB_ARGS_REQ(2));
+  mrb_define_method_id(mrb, ssl_socket_class, mrb_intern_lit(mrb, "__transport_eof_probe"),
+                               mrb_ssl_socket_transport_eof_probe, MRB_ARGS_REQ(1));
+#endif
 #endif
   mrb_define_method_id(mrb, ssl_socket_class, MRB_SYM(send), mrb_ssl_socket_send, MRB_ARGS_REQ(2));
   mrb_define_method_id(mrb, ssl_socket_class, MRB_SYM(read_nonblock), mrb_ssl_socket_read_nonblock, MRB_ARGS_REQ(1));

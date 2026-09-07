@@ -61,6 +61,7 @@ TCPSocket_create(picorb_state *vm, picorb_socket_t *sock)
   sock->remote_port = 0;
   sock->connected = false;
   sock->closed = false;
+  sock->transport_error = PICORB_TRANSPORT_OK;
 
   return true;
 }
@@ -128,7 +129,6 @@ tcp_recv_callback(void *arg, struct altcp_pcb *pcb, struct pbuf *pbuf, err_t err
   if (new_size > sock->recv_capacity) {
     /* Buffer full - cannot accept more data */
     D("tcp_recv_callback: buffer full, dropping data");
-    pbuf_free(pbuf);
     return ERR_MEM;
   }
 
@@ -155,7 +155,8 @@ tcp_recv_callback(void *arg, struct altcp_pcb *pcb, struct pbuf *pbuf, err_t err
 static err_t
 tcp_sent_callback(void *arg, struct altcp_pcb *pcb, u16_t len)
 {
-  /* Nothing special to do */
+  picorb_socket_t *sock = (picorb_socket_t *)arg;
+  picorb_socket_notify_readable(sock);
   return ERR_OK;
 }
 
@@ -273,6 +274,18 @@ TCPSocket_connect(picorb_state *vm, picorb_socket_t *sock, const char *host, int
   }
 }
 
+bool
+TCPSocket_connect_deadline(picorb_state *vm, picorb_socket_t *sock,
+                           const char *host, int port, int64_t deadline_us)
+{
+  (void)deadline_us;
+  bool result = TCPSocket_connect(vm, sock, host, port);
+  if (!result && sock && sock->transport_error == PICORB_TRANSPORT_OK) {
+    sock->transport_error = PICORB_TRANSPORT_CONNECT_FAILED;
+  }
+  return result;
+}
+
 int
 TCPSocket_connection_state(picorb_state *vm, picorb_socket_t *sock)
 {
@@ -309,11 +322,52 @@ TCPSocket_send(picorb_state *vm, picorb_socket_t *sock, const void *data, size_t
   return (ssize_t)len;
 }
 
+ssize_t
+TCPSocket_send_deadline(picorb_state *vm, picorb_socket_t *sock,
+                        const void *data, size_t len, int64_t deadline_us)
+{
+  (void)vm;
+  (void)deadline_us;
+  if (!sock || !data || !sock->pcb || sock->state != SOCKET_STATE_CONNECTED) {
+    if (sock) sock->transport_error = PICORB_TRANSPORT_WRITE_FAILED;
+    return -1;
+  }
+  lwip_begin();
+  u16_t available = altcp_sndbuf(sock->pcb);
+  lwip_end();
+  if (available == 0) {
+    sock->event_pending = false;
+    return PICORB_SEND_WOULD_BLOCK;
+  }
+  size_t accepted = len;
+  if (accepted > available) accepted = available;
+  if (accepted > 1024) accepted = 1024;
+  lwip_begin();
+  err_t error = altcp_write(sock->pcb, data, (u16_t)accepted, TCP_WRITE_FLAG_COPY);
+  if (error != ERR_OK) {
+    lwip_end();
+    if (error == ERR_MEM || error == ERR_WOULDBLOCK) {
+      sock->event_pending = false;
+      return PICORB_SEND_WOULD_BLOCK;
+    }
+    sock->transport_error = PICORB_TRANSPORT_WRITE_FAILED;
+    return -1;
+  }
+  error = altcp_output(sock->pcb);
+  lwip_end();
+  if (error != ERR_OK) {
+    sock->transport_error = PICORB_TRANSPORT_WRITE_FAILED;
+    return PICORB_SEND_ACCEPTED_FAILED;
+  }
+  return (ssize_t)accepted;
+}
+
 /* Receive data */
 ssize_t
 TCPSocket_recv(picorb_state *vm, picorb_socket_t *sock, void *buf, size_t len, bool nonblock)
 {
   if (!sock || !buf || sock->state == SOCKET_STATE_ERROR) {
+    if (sock) sock->transport_error = PICORB_TRANSPORT_READ_FAILED;
     D("TCPSocket_recv: sock=%p, buf=%p, state=%d (ERROR)\n",
       (void*)sock, buf, sock ? sock->state : -1);
     return -1;
@@ -369,6 +423,33 @@ TCPSocket_recv(picorb_state *vm, picorb_socket_t *sock, void *buf, size_t len, b
   }
 
   return (ssize_t)to_copy;
+}
+
+ssize_t
+TCPSocket_recv_deadline(picorb_state *vm, picorb_socket_t *sock,
+                        void *buf, size_t len, int64_t deadline_us)
+{
+  (void)deadline_us;
+  ssize_t result = TCPSocket_recv(vm, sock, buf, len, true);
+  if (result < 0 && result != PICORB_RECV_WOULD_BLOCK && sock) {
+    sock->transport_error = PICORB_TRANSPORT_READ_FAILED;
+  }
+  return result;
+}
+
+int
+TCPSocket_eof_probe(picorb_state *vm, picorb_socket_t *sock, int64_t deadline_us)
+{
+  (void)vm;
+  (void)deadline_us;
+  if (!sock || sock->state == SOCKET_STATE_ERROR) {
+    if (sock) sock->transport_error = PICORB_TRANSPORT_READ_FAILED;
+    return PICORB_PROBE_ERROR;
+  }
+  if (sock->recv_len > 0) return PICORB_PROBE_DATA;
+  if (sock->state == SOCKET_STATE_CLOSED) return PICORB_PROBE_EOF;
+  sock->event_pending = false;
+  return PICORB_PROBE_WOULD_BLOCK;
 }
 
 /* Check if data is ready to read */

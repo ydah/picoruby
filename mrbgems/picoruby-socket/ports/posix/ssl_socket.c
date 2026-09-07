@@ -13,10 +13,36 @@
 #include <fcntl.h>
 #include <sys/select.h>
 #include <sys/socket.h>
+#include <sys/poll.h>
+#include <limits.h>
+#include "machine.h"
 
 #include <openssl/ssl.h>
 #include <openssl/err.h>
+#include <openssl/pem.h>
 #include <openssl/x509.h>
+
+static int
+ssl_wait_fd(int fd, short events, int64_t deadline_us)
+{
+  struct pollfd poll_fd;
+  poll_fd.fd = fd;
+  poll_fd.events = events;
+  poll_fd.revents = 0;
+  while (true) {
+    int timeout_ms = -1;
+    if (deadline_us > 0) {
+      int64_t remaining = deadline_us - (int64_t)Machine_uptime_us();
+      if (remaining <= 0 || remaining < 1000) return 0;
+      int64_t milliseconds = remaining / 1000;
+      timeout_ms = milliseconds > INT_MAX ? INT_MAX : (int)milliseconds;
+    }
+    int result = poll(&poll_fd, 1, timeout_ms);
+    if (result > 0) return 1;
+    if (result == 0) return 0;
+    if (errno != EINTR) return -1;
+  }
+}
 
 /* SSL Context and SSL Socket structures are now defined in socket.h */
 
@@ -80,45 +106,66 @@ SSLContext_set_ca_file(picorb_state *vm, picorb_ssl_context_t *ctx, const char *
     return false;
   }
 
-  // Free previous ca_file if set
-  if (ctx->ca_file) {
-    picorb_free(vm, ctx->ca_file);
-    ctx->ca_file = NULL;
-  }
-
-  // Store ca_file path
   size_t ca_file_len = strlen(ca_file);
-  ctx->ca_file = (char *)picorb_alloc(vm, ca_file_len + 1);
-  if (!ctx->ca_file) {
+  char *new_ca_file = (char *)picorb_alloc(vm, ca_file_len + 1);
+  if (!new_ca_file) {
     return false;
   }
-  memcpy(ctx->ca_file, ca_file, ca_file_len);
-  ctx->ca_file[ca_file_len] = '\0';
+  memcpy(new_ca_file, ca_file, ca_file_len);
+  new_ca_file[ca_file_len] = '\0';
 
-  // Load CA certificate file
-  if (SSL_CTX_load_verify_locations(ctx->ctx, ca_file, NULL) != 1) {
-    picorb_free(vm, ctx->ca_file);
-    ctx->ca_file = NULL;
-    fprintf(stderr, "SSL: Failed to load CA file: %s\n", ca_file);
-    ERR_print_errors_fp(stderr);
+  X509_STORE *store = X509_STORE_new();
+  if (!store || X509_STORE_load_locations(store, ca_file, NULL) != 1) {
+    X509_STORE_free(store);
+    picorb_free(vm, new_ca_file);
     return false;
   }
 
+  SSL_CTX_set_cert_store(ctx->ctx, store);
+  if (ctx->ca_file) picorb_free(vm, ctx->ca_file);
+  ctx->ca_file = new_ca_file;
   return true;
 }
 
 /*
  * Set CA certificate from memory
- * Not supported on POSIX - use set_ca_file instead
  */
 bool
 SSLContext_set_ca(picorb_state *vm, picorb_ssl_context_t *ctx, const void *addr, size_t size)
 {
-  (void)ctx;
-  (void)addr;
-  (void)size;
-  fprintf(stderr, "Warning: SSLContext#set_ca is not supported on POSIX platforms. Use ca_file= instead.\n");
-  return true;  /* Return true to avoid errors, but do nothing */
+  if (!ctx || !addr || size == 0 || size > INT_MAX) return false;
+
+  BIO *bio = BIO_new_mem_buf(addr, (int)size);
+  X509_STORE *store = X509_STORE_new();
+  STACK_OF(X509_INFO) *infos = bio ? PEM_X509_INFO_read_bio(bio, NULL, NULL, NULL) : NULL;
+  int certificate_count = 0;
+  if (infos && store) {
+    int i = 0;
+    int count = sk_X509_INFO_num(infos);
+    while (i < count) {
+      X509_INFO *info = sk_X509_INFO_value(infos, i);
+      if (info->x509) {
+        if (X509_STORE_add_cert(store, info->x509) != 1) break;
+        certificate_count++;
+      }
+      if (info->crl && X509_STORE_add_crl(store, info->crl) != 1) break;
+      i++;
+    }
+    if (i < count) certificate_count = 0;
+  }
+  sk_X509_INFO_pop_free(infos, X509_INFO_free);
+  BIO_free(bio);
+  if (certificate_count == 0) {
+    X509_STORE_free(store);
+    return false;
+  }
+
+  SSL_CTX_set_cert_store(ctx->ctx, store);
+  if (ctx->ca_file) {
+    picorb_free(vm, ctx->ca_file);
+    ctx->ca_file = NULL;
+  }
+  return true;
 }
 
 /*
@@ -308,6 +355,7 @@ SSLSocket_create(picorb_state *vm, picorb_ssl_context_t *ssl_ctx)
   ssl_sock->hostname = NULL;
   ssl_sock->port = 0;
   ssl_sock->connected = false;
+  ssl_sock->transport_error = PICORB_TRANSPORT_OK;
 
   return ssl_sock;
 }
@@ -360,6 +408,13 @@ SSLSocket_set_port(picorb_state *vm, picorb_ssl_socket_t *ssl_sock, int port)
 bool
 SSLSocket_connect(picorb_state *vm, picorb_ssl_socket_t *ssl_sock)
 {
+  return SSLSocket_connect_deadline(vm, ssl_sock, 0);
+}
+
+bool
+SSLSocket_connect_deadline(picorb_state *vm, picorb_ssl_socket_t *ssl_sock,
+                           int64_t deadline_us)
+{
   if (!ssl_sock || ssl_sock->connected || !ssl_sock->hostname) {
     return false;
   }
@@ -372,21 +427,21 @@ SSLSocket_connect(picorb_state *vm, picorb_ssl_socket_t *ssl_sock)
   /* Create underlying TCP socket */
   ssl_sock->base_socket = (picorb_socket_t*)picorb_alloc(vm, sizeof(picorb_socket_t));
   if (!ssl_sock->base_socket) {
-    fprintf(stderr, "SSL: Failed to allocate TCP socket\n");
+    ssl_sock->transport_error = PICORB_TRANSPORT_RESOURCE_EXHAUSTED;
     return false;
   }
 
   if (!TCPSocket_create(vm, ssl_sock->base_socket)) {
-    fprintf(stderr, "SSL: Failed to create TCP socket\n");
+    ssl_sock->transport_error = PICORB_TRANSPORT_RESOURCE_EXHAUSTED;
     picorb_free(vm, ssl_sock->base_socket);
     ssl_sock->base_socket = NULL;
     return false;
   }
 
   /* Connect TCP socket */
-  if (!TCPSocket_connect(vm, ssl_sock->base_socket, ssl_sock->hostname, ssl_sock->port)) {
-    fprintf(stderr, "SSL: Failed to connect TCP socket to %s:%d\n",
-            ssl_sock->hostname, ssl_sock->port);
+  if (!TCPSocket_connect_deadline(vm, ssl_sock->base_socket, ssl_sock->hostname,
+                                  ssl_sock->port, deadline_us)) {
+    ssl_sock->transport_error = ssl_sock->base_socket->transport_error;
     TCPSocket_close(vm, ssl_sock->base_socket);
     picorb_free(vm, ssl_sock->base_socket);
     ssl_sock->base_socket = NULL;
@@ -396,8 +451,7 @@ SSLSocket_connect(picorb_state *vm, picorb_ssl_socket_t *ssl_sock)
   /* Create SSL structure */
   ssl_sock->ssl = SSL_new(ssl_sock->ssl_ctx->ctx);
   if (!ssl_sock->ssl) {
-    fprintf(stderr, "SSL: SSL_new failed\n");
-    ERR_print_errors_fp(stderr);
+    ssl_sock->transport_error = PICORB_TRANSPORT_RESOURCE_EXHAUSTED;
     TCPSocket_close(vm, ssl_sock->base_socket);
     picorb_free(vm, ssl_sock->base_socket);
     ssl_sock->base_socket = NULL;
@@ -406,8 +460,7 @@ SSLSocket_connect(picorb_state *vm, picorb_ssl_socket_t *ssl_sock)
 
   /* Set file descriptor for SSL */
   if (SSL_set_fd(ssl_sock->ssl, ssl_sock->base_socket->fd) != 1) {
-    fprintf(stderr, "SSL: SSL_set_fd failed\n");
-    ERR_print_errors_fp(stderr);
+    ssl_sock->transport_error = PICORB_TRANSPORT_TLS_FAILED;
     SSL_free(ssl_sock->ssl);
     ssl_sock->ssl = NULL;
     TCPSocket_close(vm, ssl_sock->base_socket);
@@ -418,8 +471,7 @@ SSLSocket_connect(picorb_state *vm, picorb_ssl_socket_t *ssl_sock)
 
   /* Set SNI hostname */
   if (SSL_set_tlsext_host_name(ssl_sock->ssl, ssl_sock->hostname) != 1) {
-    fprintf(stderr, "SSL: SSL_set_tlsext_host_name failed\n");
-    ERR_print_errors_fp(stderr);
+    ssl_sock->transport_error = PICORB_TRANSPORT_TLS_FAILED;
     SSL_free(ssl_sock->ssl);
     ssl_sock->ssl = NULL;
     TCPSocket_close(vm, ssl_sock->base_socket);
@@ -430,8 +482,7 @@ SSLSocket_connect(picorb_state *vm, picorb_ssl_socket_t *ssl_sock)
 
   /* Set hostname for certificate verification */
   if (SSL_set1_host(ssl_sock->ssl, ssl_sock->hostname) != 1) {
-    fprintf(stderr, "SSL: SSL_set1_host failed\n");
-    ERR_print_errors_fp(stderr);
+    ssl_sock->transport_error = PICORB_TRANSPORT_TLS_FAILED;
     SSL_free(ssl_sock->ssl);
     ssl_sock->ssl = NULL;
     TCPSocket_close(vm, ssl_sock->base_socket);
@@ -441,11 +492,20 @@ SSLSocket_connect(picorb_state *vm, picorb_ssl_socket_t *ssl_sock)
   }
 
   /* Perform SSL handshake */
-  int ret = SSL_connect(ssl_sock->ssl);
-  if (ret != 1) {
-    int err = SSL_get_error(ssl_sock->ssl, ret);
-    fprintf(stderr, "SSL: SSL_connect failed with error %d\n", err);
-    ERR_print_errors_fp(stderr);
+  int ret;
+  while ((ret = SSL_connect(ssl_sock->ssl)) != 1) {
+    int ssl_error = SSL_get_error(ssl_sock->ssl, ret);
+    if (ssl_error == SSL_ERROR_WANT_READ || ssl_error == SSL_ERROR_WANT_WRITE) {
+      int ready = ssl_wait_fd(ssl_sock->base_socket->fd,
+                              ssl_error == SSL_ERROR_WANT_READ ? POLLIN : POLLOUT,
+                              deadline_us);
+      if (ready > 0) continue;
+      ssl_sock->transport_error = ready == 0 ? PICORB_TRANSPORT_TLS_TIMEOUT : PICORB_TRANSPORT_TLS_FAILED;
+    } else {
+      long verify_result = SSL_get_verify_result(ssl_sock->ssl);
+      ssl_sock->transport_error = verify_result == X509_V_OK ?
+        PICORB_TRANSPORT_TLS_FAILED : PICORB_TRANSPORT_TLS_VERIFICATION_FAILED;
+    }
     SSL_free(ssl_sock->ssl);
     ssl_sock->ssl = NULL;
     TCPSocket_close(vm, ssl_sock->base_socket);
@@ -458,7 +518,7 @@ SSLSocket_connect(picorb_state *vm, picorb_ssl_socket_t *ssl_sock)
   if (ssl_sock->ssl_ctx->verify_mode == SSL_VERIFY_PEER) {
     long verify_result = SSL_get_verify_result(ssl_sock->ssl);
     if (verify_result != X509_V_OK) {
-      fprintf(stderr, "SSL: Certificate verification failed: %ld\n", verify_result);
+      ssl_sock->transport_error = PICORB_TRANSPORT_TLS_VERIFICATION_FAILED;
       SSL_free(ssl_sock->ssl);
       ssl_sock->ssl = NULL;
       TCPSocket_close(vm, ssl_sock->base_socket);
@@ -469,6 +529,7 @@ SSLSocket_connect(picorb_state *vm, picorb_ssl_socket_t *ssl_sock)
   }
 
   ssl_sock->connected = true;
+  ssl_sock->transport_error = PICORB_TRANSPORT_OK;
   return true;
 }
 
@@ -511,6 +572,34 @@ SSLSocket_send(picorb_state *vm, picorb_ssl_socket_t *ssl_sock, const void *data
   }
 
   return (ssize_t)ret;
+}
+
+ssize_t
+SSLSocket_send_deadline(picorb_state *vm, picorb_ssl_socket_t *ssl_sock,
+                        const void *data, size_t len, int64_t deadline_us)
+{
+  (void)vm;
+  if (!ssl_sock || !ssl_sock->connected || !data || len == 0) {
+    if (ssl_sock) ssl_sock->transport_error = PICORB_TRANSPORT_WRITE_FAILED;
+    return -1;
+  }
+  int write_len = len > (size_t)INT_MAX ? INT_MAX : (int)len;
+  while (true) {
+    int result = SSL_write(ssl_sock->ssl, data, write_len);
+    if (result > 0) return result;
+    int ssl_error = SSL_get_error(ssl_sock->ssl, result);
+    if (ssl_error != SSL_ERROR_WANT_READ && ssl_error != SSL_ERROR_WANT_WRITE) {
+      ssl_sock->transport_error = PICORB_TRANSPORT_WRITE_FAILED;
+      return -1;
+    }
+    int ready = ssl_wait_fd(ssl_sock->base_socket->fd,
+                            ssl_error == SSL_ERROR_WANT_READ ? POLLIN : POLLOUT,
+                            deadline_us);
+    if (ready <= 0) {
+      ssl_sock->transport_error = ready == 0 ? PICORB_TRANSPORT_WRITE_TIMEOUT : PICORB_TRANSPORT_WRITE_FAILED;
+      return -1;
+    }
+  }
 }
 
 /*
@@ -594,6 +683,70 @@ SSLSocket_recv(picorb_state *vm, picorb_ssl_socket_t *ssl_sock, void *buf, size_
   return (ssize_t)ret;
 }
 
+ssize_t
+SSLSocket_recv_deadline(picorb_state *vm, picorb_ssl_socket_t *ssl_sock,
+                        void *buf, size_t len, int64_t deadline_us)
+{
+  (void)vm;
+  if (!ssl_sock || !ssl_sock->connected || !buf || len == 0) {
+    if (ssl_sock) ssl_sock->transport_error = PICORB_TRANSPORT_READ_FAILED;
+    return -1;
+  }
+  int read_len = len > (size_t)INT_MAX ? INT_MAX : (int)len;
+  while (true) {
+    int result = SSL_read(ssl_sock->ssl, buf, read_len);
+    if (result > 0) return result;
+    int ssl_error = SSL_get_error(ssl_sock->ssl, result);
+    if (ssl_error == SSL_ERROR_ZERO_RETURN) {
+      ssl_sock->connected = false;
+      return 0;
+    }
+    if (ssl_error != SSL_ERROR_WANT_READ && ssl_error != SSL_ERROR_WANT_WRITE) {
+      ssl_sock->transport_error = PICORB_TRANSPORT_READ_FAILED;
+      return -1;
+    }
+    int ready = ssl_wait_fd(ssl_sock->base_socket->fd,
+                            ssl_error == SSL_ERROR_WANT_READ ? POLLIN : POLLOUT,
+                            deadline_us);
+    if (ready <= 0) {
+      ssl_sock->transport_error = ready == 0 ? PICORB_TRANSPORT_READ_TIMEOUT : PICORB_TRANSPORT_READ_FAILED;
+      return -1;
+    }
+  }
+}
+
+int
+SSLSocket_eof_probe(picorb_state *vm, picorb_ssl_socket_t *ssl_sock,
+                    int64_t deadline_us)
+{
+  (void)vm;
+  if (!ssl_sock || !ssl_sock->ssl || !ssl_sock->base_socket) return PICORB_PROBE_ERROR;
+  unsigned char byte;
+  while (true) {
+    int result = SSL_peek(ssl_sock->ssl, &byte, 1);
+    if (result > 0) return PICORB_PROBE_DATA;
+    int ssl_error = SSL_get_error(ssl_sock->ssl, result);
+    if (ssl_error == SSL_ERROR_ZERO_RETURN) return PICORB_PROBE_EOF;
+    if (ssl_error != SSL_ERROR_WANT_READ && ssl_error != SSL_ERROR_WANT_WRITE) {
+      ssl_sock->transport_error = PICORB_TRANSPORT_READ_FAILED;
+      return PICORB_PROBE_ERROR;
+    }
+    int ready = ssl_wait_fd(ssl_sock->base_socket->fd,
+                            ssl_error == SSL_ERROR_WANT_READ ? POLLIN : POLLOUT,
+                            deadline_us);
+    if (ready <= 0) {
+      ssl_sock->transport_error = ready == 0 ? PICORB_TRANSPORT_READ_TIMEOUT : PICORB_TRANSPORT_READ_FAILED;
+      return PICORB_PROBE_ERROR;
+    }
+  }
+}
+
+picorb_transport_error_t
+SSLSocket_transport_error(picorb_ssl_socket_t *ssl_sock)
+{
+  return ssl_sock ? ssl_sock->transport_error : PICORB_TRANSPORT_READ_FAILED;
+}
+
 /*
  * Close SSL socket
  */
@@ -606,6 +759,10 @@ SSLSocket_close(picorb_state *vm, picorb_ssl_socket_t *ssl_sock)
 
   /* Send close_notify alert if connected */
   if (ssl_sock->connected && ssl_sock->ssl) {
+    if (ssl_sock->base_socket && ssl_sock->base_socket->fd >= 0) {
+      int flags = fcntl(ssl_sock->base_socket->fd, F_GETFL, 0);
+      if (flags >= 0) fcntl(ssl_sock->base_socket->fd, F_SETFL, flags | O_NONBLOCK);
+    }
     SSL_shutdown(ssl_sock->ssl);
   }
 

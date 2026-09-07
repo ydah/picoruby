@@ -12,6 +12,24 @@
 
 #define SOCKET_ERROR_MSG_LEN 128
 
+typedef enum {
+  PICORB_TRANSPORT_OK = 0,
+  PICORB_TRANSPORT_TIMEOUT,
+  PICORB_TRANSPORT_DNS_TIMEOUT,
+  PICORB_TRANSPORT_DNS_FAILED,
+  PICORB_TRANSPORT_CONNECT_TIMEOUT,
+  PICORB_TRANSPORT_CONNECT_FAILED,
+  PICORB_TRANSPORT_TLS_TIMEOUT,
+  PICORB_TRANSPORT_TLS_VERIFICATION_FAILED,
+  PICORB_TRANSPORT_TLS_FAILED,
+  PICORB_TRANSPORT_WRITE_TIMEOUT,
+  PICORB_TRANSPORT_WRITE_FAILED,
+  PICORB_TRANSPORT_READ_TIMEOUT,
+  PICORB_TRANSPORT_READ_FAILED,
+  PICORB_TRANSPORT_RESOURCE_EXHAUSTED,
+  PICORB_TRANSPORT_UNSUPPORTED
+} picorb_transport_error_t;
+
 /* Connection states returned by the socket polling API. */
 #define SOCKET_STATE_NONE        0
 #define SOCKET_STATE_CONNECTING  1
@@ -32,6 +50,7 @@ typedef struct {
   char remote_host[256];
   int remote_port;
   char errmsg[SOCKET_ERROR_MSG_LEN]; /* Last error message from C layer */
+  picorb_transport_error_t transport_error;
 } picorb_socket_t;
 #endif
 
@@ -60,6 +79,7 @@ typedef struct {
   void *vm;                   /* Owning VM for callback notification */
   void *event_queue;          /* VM-specific Task::Queue value (RP2040 only) */
   bool event_pending;         /* A readable notification is already queued */
+  picorb_transport_error_t transport_error;
 } picorb_socket_t;
 
 /* LwIP helper functions - implemented in ports/rp2040/ */
@@ -103,6 +123,13 @@ void picorb_socket_notify_readable(picorb_socket_t *sock);
 #define PICORB_RECV_WOULD_BLOCK (-2)
 /* Special return value from blocking read functions: timed out waiting for data */
 #define PICORB_RECV_TIMEOUT     (-3)
+#define PICORB_SEND_WOULD_BLOCK (-2)
+#define PICORB_SEND_ACCEPTED_FAILED (-3)
+
+#define PICORB_PROBE_ERROR       (-1)
+#define PICORB_PROBE_EOF          0
+#define PICORB_PROBE_DATA         1
+#define PICORB_PROBE_WOULD_BLOCK  2
 
 /* Stack buffer threshold: use stack allocation for small reads to avoid heap overhead */
 #define PICORB_SOCKET_STACK_BUF_SIZE 101
@@ -110,9 +137,16 @@ void picorb_socket_notify_readable(picorb_socket_t *sock);
 /* TCP Socket API */
 bool TCPSocket_create(picorb_state *vm, picorb_socket_t *sock);
 bool TCPSocket_connect(picorb_state *vm, picorb_socket_t *sock, const char *host, int port);
+bool TCPSocket_connect_deadline(picorb_state *vm, picorb_socket_t *sock,
+                                const char *host, int port, int64_t deadline_us);
 int TCPSocket_connection_state(picorb_state *vm, picorb_socket_t *sock);
 ssize_t TCPSocket_send(picorb_state *vm, picorb_socket_t *sock, const void *data, size_t len);
 ssize_t TCPSocket_recv(picorb_state *vm, picorb_socket_t *sock, void *buf, size_t len, bool nonblock);
+ssize_t TCPSocket_send_deadline(picorb_state *vm, picorb_socket_t *sock,
+                                const void *data, size_t len, int64_t deadline_us);
+ssize_t TCPSocket_recv_deadline(picorb_state *vm, picorb_socket_t *sock,
+                                void *buf, size_t len, int64_t deadline_us);
+int TCPSocket_eof_probe(picorb_state *vm, picorb_socket_t *sock, int64_t deadline_us);
 bool TCPSocket_close(picorb_state *vm, picorb_socket_t *sock);
 
 /* Get socket info */
@@ -201,6 +235,7 @@ typedef struct picorb_ssl_socket {
   char *hostname;
   int port;
   bool connected;
+  picorb_transport_error_t transport_error;
 } picorb_ssl_socket_t;
 #else
 typedef struct picorb_ssl_socket picorb_ssl_socket_t;
@@ -211,11 +246,21 @@ bool SSLSocket_set_hostname(picorb_state *vm, picorb_ssl_socket_t *ssl_sock, con
 bool SSLSocket_set_connect_hostname(picorb_state *vm, picorb_ssl_socket_t *ssl_sock, const char *hostname);
 bool SSLSocket_set_port(picorb_state *vm, picorb_ssl_socket_t *ssl_sock, int port);
 bool SSLSocket_connect(picorb_state *vm, picorb_ssl_socket_t *ssl_sock);
+bool SSLSocket_connect_deadline(picorb_state *vm, picorb_ssl_socket_t *ssl_sock,
+                                int64_t deadline_us);
 int SSLSocket_connection_state(picorb_state *vm, picorb_ssl_socket_t *ssl_sock);
 bool SSLSocket_finish_connect(picorb_state *vm, picorb_ssl_socket_t *ssl_sock);
 picorb_socket_t* SSLSocket_event_socket(picorb_ssl_socket_t *ssl_sock);
 ssize_t SSLSocket_send(picorb_state *vm, picorb_ssl_socket_t *ssl_sock, const void *data, size_t len);
 ssize_t SSLSocket_recv(picorb_state *vm, picorb_ssl_socket_t *ssl_sock, void *buf, size_t len, bool nonblock);
+ssize_t SSLSocket_send_deadline(picorb_state *vm, picorb_ssl_socket_t *ssl_sock,
+                                const void *data, size_t len, int64_t deadline_us);
+ssize_t SSLSocket_recv_deadline(picorb_state *vm, picorb_ssl_socket_t *ssl_sock,
+                                void *buf, size_t len, int64_t deadline_us);
+int SSLSocket_eof_probe(picorb_state *vm, picorb_ssl_socket_t *ssl_sock,
+                        int64_t deadline_us);
+picorb_transport_error_t SSLSocket_transport_error(picorb_ssl_socket_t *ssl_sock);
+void SSLSocket_handshake_failed(void *arg, uint32_t verify_result);
 bool SSLSocket_close(picorb_state *vm, picorb_ssl_socket_t *ssl_sock);
 bool SSLSocket_closed(picorb_state *vm, picorb_ssl_socket_t *ssl_sock);
 bool SSLSocket_ready(picorb_state *vm, picorb_ssl_socket_t *ssl_sock);
@@ -248,6 +293,8 @@ bool resolve_address(const char *host, char *ip, size_t ip_len);
   /* Forward declaration for mruby data type */
   struct mrb_data_type;
   extern const struct mrb_data_type mrb_socket_type;
+  const char *picorb_transport_error_reason(picorb_transport_error_t error);
+  void picorb_raise_transport_error(mrb_state *mrb, picorb_transport_error_t error);
 #endif
 
 #endif /* PICORUBY_SOCKET_H */

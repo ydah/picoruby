@@ -1,10 +1,22 @@
 class SocketError < StandardError
 end
 
+class SocketTransportError < SocketError
+  attr_reader reason: Symbol
+  def initialize: (Symbol reason) -> void
+end
+
 class BasicSocket
   CONNECTION_TIMEOUT_MS: Integer
   READ_TIMEOUT_MS: Integer
 
+  def self.__remaining_timeout_ms: (Integer? deadline, Symbol reason) -> Integer?
+  def __transport_read: (Integer maxlen, Integer deadline) -> untyped
+  def __transport_write: (String buffer, Integer offset, Integer length, Integer deadline) -> untyped
+  def __transport_eof_probe: (Integer deadline) -> untyped
+  private def __transport_read_poll: (Integer maxlen, Integer deadline) -> String?
+  private def __transport_write_poll: (String buffer, Integer offset, Integer length, Integer deadline) -> Integer?
+  private def __transport_eof_probe_poll: (Integer deadline) -> Integer
   def puts: (*untyped args) -> nil
   def gets: (?String sep) -> String?
   def print: (*untyped args) -> nil

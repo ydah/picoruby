@@ -1,10 +1,69 @@
 class SocketError < StandardError; end
 
+class SocketTransportError < SocketError
+  attr_reader :reason
+
+  def initialize(reason)
+    @reason = reason
+    super(reason.to_s)
+  end
+end
+
 class EOFError < IOError; end
 
 class BasicSocket
   CONNECTION_TIMEOUT_MS = 10_000
   READ_TIMEOUT_MS = 60_000
+
+  def self.__remaining_timeout_ms(deadline, reason)
+    return nil if deadline.nil?
+    remaining = deadline - Machine.uptime_us
+    raise SocketTransportError.new(reason) if remaining <= 0
+    milliseconds = remaining / 1_000
+    raise SocketTransportError.new(reason) if milliseconds <= 0
+    milliseconds
+  end
+
+  if Object.const_defined?(:SocketDNSResolver)
+    def __transport_read(maxlen, deadline)
+      event_queue = @event_queue
+      data = __transport_read_poll(maxlen, deadline)
+      while data.nil?
+        timeout_ms = BasicSocket.__remaining_timeout_ms(deadline, :timeout)
+        unless event_queue && event_queue.pop(timeout_ms: timeout_ms)
+          raise SocketTransportError.new(:timeout)
+        end
+        data = __transport_read_poll(maxlen, deadline)
+      end
+      data
+    end
+
+    def __transport_write(buffer, offset, length, deadline)
+      event_queue = @event_queue
+      while true
+        count = __transport_write_poll(buffer, offset, length, deadline)
+        return count if count
+        timeout_ms = BasicSocket.__remaining_timeout_ms(deadline, :timeout)
+        unless event_queue && event_queue.pop(timeout_ms: timeout_ms)
+          raise SocketTransportError.new(:timeout)
+        end
+      end
+    end
+
+    def __transport_eof_probe(deadline)
+      event_queue = @event_queue
+      while true
+        state = __transport_eof_probe_poll(deadline)
+        return :eof if state == 0
+        return :extra_data if state == 1
+        raise SocketTransportError.new(:read_failed) unless state == 2
+        timeout_ms = BasicSocket.__remaining_timeout_ms(deadline, :timeout)
+        unless event_queue && event_queue.pop(timeout_ms: timeout_ms)
+          raise SocketTransportError.new(:timeout)
+        end
+      end
+    end
+  end
 
   private def __connection_timeout_ms
     CONNECTION_TIMEOUT_MS
